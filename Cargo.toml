@@ -39,8 +39,8 @@ pipewire = { version = "0.9", features = ["v0_3_49"] } # same as alvr_audio, who
 
 [dev-dependencies]
 # xr_probe example only
-openxr = "0.22"
-ash = { version = "0.38", default-features = false, features = ["loaded"] }
+openxr = "=0.22.0"
+ash = { version = "=0.38.0", default-features = false, features = ["loaded"] }
 
 [build-dependencies]
 bindgen = "0.72"
