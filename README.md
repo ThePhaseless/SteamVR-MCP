@@ -402,6 +402,8 @@ Common errors at run time:
 
 ## Development
 
+CI runs clippy and the tests that need no Steam or desktop. To run the same checks locally: `cargo clippy --all-targets -- -D warnings && cargo test --lib --test config_reload --test setup_roundtrip`.
+
 ### Bumping the ALVR pin
 
 Change `rev` for every `alvr_*` dependency in `Cargo.toml`, install the matching streamer, and run `cargo test`. Then run the live tests.

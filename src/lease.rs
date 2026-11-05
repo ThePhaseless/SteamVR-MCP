@@ -36,7 +36,7 @@ pub fn alive(pid: u32) -> bool {
 }
 
 /// The lease when another live process holds it and it has not expired.
-pub fn blocking<'a>(lease: Option<&'a Lease>, me: u32, now: SystemTime, alive: impl Fn(u32) -> bool) -> Option<&'a Lease> {
+pub fn blocking(lease: Option<&Lease>, me: u32, now: SystemTime, alive: impl Fn(u32) -> bool) -> Option<&Lease> {
     // shortcut: a reused pid keeps a dead lease alive until expires_at, compare process start time when it bites
     // an expires_at that will not parse counts as expired
     lease.filter(|l| l.pid != me && clock::parse_rfc3339(&l.expires_at).is_some_and(|t| t > now) && alive(l.pid))

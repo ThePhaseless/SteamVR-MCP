@@ -473,7 +473,7 @@ pub fn parse_shortcuts(bytes: &[u8]) -> Vec<(u32, String)> {
             let key = cstr(&mut i)?;
             match kind {
                 0x00 => (),
-                0x01 => name = Some(cstr(&mut i)?).filter(|_| key.eq_ignore_ascii_case("appname")).or(name),
+                0x01 => name = key.eq_ignore_ascii_case("appname").then_some(cstr(&mut i)?).or(name),
                 0x02 => {
                     let v = i32::from_le_bytes(b.get(i..i + 4)?.try_into().ok()?);
                     i += 4;

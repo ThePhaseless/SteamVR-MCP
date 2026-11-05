@@ -417,7 +417,7 @@ mod tests {
         let (steam, install, mut logs) = game("page", &["${install}/a.log"]);
         logs.poll(Some(&steam));
         let write = |range: std::ops::Range<u32>| range.map(|n| format!("l{n}\n")).collect::<String>();
-        append(&install.join("a.log"), &write(1..1201));
+        append(&install.join("a.log"), write(1..1201));
         logs.poll(Some(&steam));
         let first = logs.page(42, 0, None, PAGE).unwrap();
         assert_eq!((first.lines.len(), first.next_seq), (PAGE, 501));
@@ -425,7 +425,7 @@ mod tests {
         assert_eq!((second.lines[0].seq, second.lines[0].text.as_str(), second.next_seq), (501, "l501", 1001));
         assert_eq!(logs.page(42, 1201, None, PAGE).unwrap().next_seq, 1201);
         assert_eq!(logs.page(42, 9000, None, PAGE).unwrap().next_seq, 9000, "a future cursor stays where it is");
-        append(&install.join("a.log"), &write(1201..5101));
+        append(&install.join("a.log"), write(1201..5101));
         logs.poll(Some(&steam));
         let kept = logs.page(42, 0, None, PAGE).unwrap();
         assert_eq!((kept.lines[0].seq, kept.next_seq), (5100 - LINES_KEPT as u64 + 1, 5100 - LINES_KEPT as u64 + 1 + PAGE as u64));

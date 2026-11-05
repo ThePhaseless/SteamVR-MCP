@@ -276,7 +276,8 @@ fn crop(eye: Eye, width: u32, height: u32, rgb: &[u8]) -> (u32, Vec<u8>) {
 pub fn encode_rgb(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>> {
     let mut png = vec![];
     let mut encoder = png::Encoder::new(&mut png, width, height);
-    (encoder.set_color(png::ColorType::Rgb), encoder.set_depth(png::BitDepth::Eight));
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
     encoder.write_header()?.write_image_data(rgb)?;
     Ok(png)
 }
@@ -602,7 +603,8 @@ mod tests {
         }
         let mut png = vec![];
         let mut encoder = png::Encoder::new(&mut png, 4, 2);
-        (encoder.set_color(png::ColorType::Rgba), encoder.set_depth(png::BitDepth::Eight));
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
         encoder.write_header().unwrap().write_image_data(&rgba).unwrap();
         let pixels = |png: &[u8]| {
             let mut reader = png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap();

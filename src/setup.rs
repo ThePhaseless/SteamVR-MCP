@@ -104,7 +104,7 @@ pub fn session_values(cfg: &Config) -> Result<Vec<PathValuePair>> {
         ("session_settings.headset.controllers.content.hand_tracking_interaction.enabled", json!(true)),
         ("session_settings.connection.client_discovery.enabled", json!(false)),
         ("session_settings.connection.allow_remote_dashboard", json!(false)),
-        ("session_settings.headset.controllers.content.button_mappings", index_button_mappings(&template)),
+        ("session_settings.headset.controllers.content.button_mappings", index_button_mappings(template)),
     ];
     defaults
         .into_iter()

@@ -352,7 +352,7 @@ mod tests {
         let api = Api { port: listener.local_addr().unwrap().port() };
         let server = std::thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();
-            s.read(&mut [0; 4096]).ok(); // the request; unread, closing would reset the connection
+            let _ = s.read(&mut [0; 4096]); // the request; unread, closing would reset the connection
             s.write_all(b"HTTP/1.1 200 OK\r\n\r\n").ok();
             let chunk = vec![b'a'; 1 << 20];
             while s.write_all(&chunk).is_ok() {} // endless: only the client's cap ends it

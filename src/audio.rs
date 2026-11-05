@@ -99,7 +99,7 @@ pub fn capture(seconds: f64) -> Result<Vec<i16>> {
                 let (offset, size) = (data.chunk().offset() as usize, data.chunk().size() as usize);
                 let Some(bytes) = data.data().and_then(|d| d.get(offset..offset + size)) else { return };
                 let mut state = state.borrow_mut();
-                state.0.extend(bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])));
+                state.0.extend(bytes.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b)));
                 if state.0.len() >= want {
                     state.0.truncate(want);
                     mainloop.quit();

@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      # alsa-sys and pipewire-sys link through pkg-config, bindgen needs libclang, openh264-sys2 assembles with nasm
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev libpipewire-0.3-dev libspa-0.2-dev libclang-dev nasm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2.9.3
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      # tests/live.rs needs SteamVR, a GPU and a desktop, so it never runs here
+      - run: cargo test --locked --lib --test config_reload --test setup_roundtrip
