@@ -352,6 +352,11 @@ pub fn blocked_drivers(vrsettings: &Path) -> Vec<String> {
     names
 }
 
+/// Whether SteamVR's safe mode blocked ALVR's driver; false when the file is unreadable.
+pub fn alvr_blocked(vrsettings: &Path) -> bool {
+    blocked_drivers(vrsettings).iter().any(|d| d == VRSETTINGS_KEYS[1].0)
+}
+
 /// After SteamVR has exited (never while a `VR_PROCESS_NAMES` process lives, which rewrites the file):
 /// clears every safe-mode block and returns the driver names. `vr_restore` still puts the snapshot back.
 pub fn undo_safe_mode_blocks(paths: &Paths) -> Result<Vec<String>> {

@@ -24,6 +24,10 @@ pub const VR_PROCESS_NAMES: &[&str] = &[
     "vrmonitor",
 ];
 
+/// Steam's processes, by comm or argv0, which vr_stop waits on after asking the Steam that vr_start started to exit.
+/// The client comes first: vr_stop forwards -shutdown only while it runs.
+pub const STEAM_PROCESS_NAMES: &[&str] = &["steam", "steam.sh", "steamwebhelper"];
+
 /// Every pid in /proc whose real uid is this user's: another user's Steam or SteamVR (a second account) is not ours to see or stop.
 /// The /proc dir owner would hide our non-dumpable file-capability helpers (vrcompositor-launcher), which show as root.
 pub fn all_pids() -> Vec<u32> {
@@ -137,11 +141,28 @@ pub fn env_mismatches(environ: &[u8], want: &BTreeMap<String, String>) -> Vec<St
     }).collect()
 }
 
+/// Whether `pid` is the Steam client, not the bootstrap script, whose exe is a shell.
+fn is_steam_client(pid: u32) -> bool {
+    exe_of(pid).is_some_and(|e| e.file_name().is_some_and(|n| n == "steam"))
+}
+
 /// The environ of the running Steam client (not the bootstrap script, whose exe is a shell); none if unreadable.
 pub fn running_steam_environ() -> Option<Vec<u8>> {
     let pids = pids_named("steam");
-    let client = pids.iter().find(|&&p| exe_of(p).is_some_and(|e| e.file_name().is_some_and(|n| n == "steam")));
+    let client = pids.iter().find(|&&p| is_steam_client(p));
     fs::read(format!("/proc/{}/environ", client.or(pids.first())?)).ok()
+}
+
+/// The Steam client as (pid, start time) when exactly one runs, so vr_stop can tell it from a Steam started later.
+/// None under test: no Steam there is ever the MCP's.
+pub fn steam_client() -> Option<(u32, u64)> {
+    if cfg!(test) {
+        return None;
+    }
+    match pids_named("steam").into_iter().filter(|&p| is_steam_client(p)).collect::<Vec<_>>()[..] {
+        [pid] => Some((pid, stat(pid)?.1)),
+        _ => None,
+    }
 }
 
 /// Polls `done` every 100 ms until it holds or `timeout` passes.
@@ -156,6 +177,11 @@ pub fn wait_for(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Whether a process named `name` runs that is not a zombie, which no wait or signal clears.
+pub fn has_live(name: &str) -> bool {
+    pids_named(name).into_iter().any(|p| stat(p).is_some_and(|(s, _)| s != 'Z'))
 }
 
 pub fn wait_gone(names: &[&str], timeout: Duration) -> bool {
@@ -211,7 +237,7 @@ pub fn terminate(pid: u32, sig: i32) {
     }
 }
 
-/// How long VrProcs::kill waits after each signal.
+/// How long VrProcs::kill waits after each signal, once for the earlier names and once for the last.
 pub const KILL_WAIT: Duration = Duration::from_secs(5);
 
 /// How long after a launch Steam may take to start SteamVR's first process.
@@ -223,8 +249,13 @@ pub struct VrProcs {
     pub names: &'static [&'static str],
     /// How long they get to exit after ALVR's shutdown request, before signals.
     pub grace: Duration,
-    /// How long each signal round waits.
+    /// How long each of kill()'s waits lasts: four at most.
     pub kill_wait: Duration,
+    /// Steam's processes, which vr_stop waits on (and never signals by name), and how long.
+    pub steam: &'static [&'static str],
+    pub steam_wait: Duration,
+    /// How long vr_stop waits on them after it sent SIGTERM to the Steam client vr_start started.
+    pub steam_term_wait: Duration,
 }
 
 /// What VrProcs::end did: whether every process is gone, and whether it took signals.
@@ -235,9 +266,10 @@ pub struct Ended {
 }
 
 impl VrProcs {
-    pub const STEAMVR: VrProcs = VrProcs { names: VR_PROCESS_NAMES, grace: Duration::from_secs(30), kill_wait: KILL_WAIT };
-    /// Matches no process: what unit tests get, so none can signal the user's SteamVR.
-    pub const NONE: VrProcs = VrProcs { names: &[], ..Self::STEAMVR };
+    pub const STEAMVR: VrProcs =
+        VrProcs { names: VR_PROCESS_NAMES, grace: Duration::from_secs(30), kill_wait: KILL_WAIT, steam: STEAM_PROCESS_NAMES, steam_wait: Duration::from_secs(60), steam_term_wait: Duration::from_secs(15) };
+    /// Matches no process: what unit tests get, so none can signal the user's SteamVR or wait on their Steam.
+    pub const NONE: VrProcs = VrProcs { names: &[], steam: &[], steam_term_wait: Duration::ZERO, ..Self::STEAMVR };
 
     /// Every such process as (pid, start time), so a later check finds it whatever its comm becomes.
     pub fn snapshot(&self) -> Vec<(u32, u64)> {
@@ -254,17 +286,25 @@ impl VrProcs {
         running(self.names)
     }
 
-    /// SIGTERM, then SIGKILL, by name (in order, so vrmonitor goes last), kill_wait apart. True when none remain.
+    /// SIGTERM, then SIGKILL, by name. Each signal reaches the last name (vrmonitor) only once the earlier ones are gone or
+    /// kill_wait passed, so vrmonitor never goes before the rest. True when none remain.
     pub fn kill(&self) -> bool {
+        let Some((last, earlier)) = self.names.split_last() else { return true };
+        let signal = |names: &[&str], sig| names.iter().flat_map(|n| pids_named(n)).for_each(|pid| terminate(pid, sig));
         for sig in [libc::SIGTERM, libc::SIGKILL] {
-            for name in self.names {
-                pids_named(name).into_iter().for_each(|pid| terminate(pid, sig));
-            }
+            signal(earlier, sig);
+            wait_for(self.kill_wait, || !earlier.iter().any(|n| has_live(n)));
+            signal(&[last], sig);
             if wait_gone(self.names, self.kill_wait) {
                 return true;
             }
         }
         false
+    }
+
+    /// The `steam` names with a live process; a zombie does not count.
+    pub fn live_steam(&self) -> Vec<&'static str> {
+        self.steam.iter().copied().filter(|n| has_live(n)).collect()
     }
 
     /// After ALVR was asked to shut SteamVR down: waits `grace`, then kills by name, then SIGKILLs the
@@ -524,7 +564,7 @@ pub fn log_since(steam_dir: &Path, name: &str, mark: LogMark) -> String {
 }
 
 /// Launch steps at which Steam can wait on a desktop dialog.
-const DIALOG_STEPS: [&str; 2] = ["ShowInterstitials", "ShowLaunchOption"];
+const DIALOG_STEPS: [&str; 3] = ["ShowInterstitials", "ShowLaunchOption", "SynchronizingCloud"];
 
 /// The AppID and step of a launch Steam holds at a desktop dialog: a wait at a DIALOG_STEPS step with
 /// no "continues" after it. Steam logs a ShowInterstitials wait for every launch and continues at once when no dialog shows.
@@ -584,6 +624,29 @@ const DIALOG_GRACE: Duration = Duration::from_secs(10);
 /// it also fails fast when Steam logs no ExecuteSteamURL for it within URL_TAKEN_WAIT.
 pub fn wait_launched(steam_dir: Option<&Path>, log_from: u64, handed_url: Option<&str>, timeout: Duration, done: impl FnMut() -> bool) -> Result<bool> {
     wait_launched_within((URL_TAKEN_WAIT, DIALOG_GRACE), steam_dir, log_from, handed_url, timeout, done)
+}
+
+/// What a wait for ALVR fails with once SteamVR's safe mode blocked its driver; each caller adds its advice.
+pub const ALVR_BLOCKED: &str = "failed: SteamVR's safe mode blocked the ALVR driver (driver_alvr_server in steamvr.vrsettings), so ALVR will not load";
+
+/// wait_launched that also fails, with ALVR_BLOCKED and `advice`, once `vrsettings` shows ALVR's driver blocked: SteamVR then never loads it.
+/// The file is read only on polls where `answered` is false, so a stale block never fails an ALVR that answers.
+pub fn wait_alvr(
+    vrsettings: Option<&Path>, steam_dir: Option<&Path>, log_from: u64, handed_url: Option<&str>, timeout: Duration, advice: &str,
+    mut answered: impl FnMut() -> bool,
+) -> Result<bool> {
+    let mut blocked = false;
+    let done = wait_launched(steam_dir, log_from, handed_url, timeout, || {
+        if answered() {
+            return true;
+        }
+        blocked = vrsettings.is_some_and(setup::alvr_blocked);
+        blocked
+    })?;
+    if blocked {
+        bail!("{ALVR_BLOCKED}{advice}");
+    }
+    Ok(done)
 }
 
 /// wait_launched with its (URL_TAKEN_WAIT, DIALOG_GRACE), which tests shorten.
@@ -733,7 +796,7 @@ pub fn restart_steamvr(
     // must be gone: a steamtours that outlives vrserver keeps Steam's AppID 250820 running, and
     // Steam then refuses the relaunch (console_log: WaitingPrevProcess, AppError_16)
     if !procs.end(&snapshot).gone {
-        bail!("SteamVR processes still running after SIGKILL: {:?} (deadline {} s)", procs.remaining(&snapshot), procs.kill_wait.as_secs());
+        bail!("SteamVR processes still running after SIGKILL: {:?}", procs.remaining(&snapshot));
     }
     // SteamVR has exited, so it no longer rewrites the file; a failure only leaves other drivers
     // blocked, so log it and relaunch anyway
@@ -752,7 +815,8 @@ pub fn restart_steamvr(
         exited = vr_exited(&mut seen);
         stopped() || exited.is_some() || (is_new_vrserver(&old, &pids_named("vrserver")) && api.ping())
     };
-    if !wait_launched(paths.steam_dir.as_deref(), log_from, handed, timeout, relaunched)? {
+    let advice = "; run vr_stop, which clears the block once SteamVR is gone, then vr_start";
+    if !wait_alvr(Some(&vrsettings), paths.steam_dir.as_deref(), log_from, handed, timeout, advice, relaunched)? {
         bail!("ALVR did not come back after the SteamVR restart (deadline {} s)", timeout.as_secs());
     }
     if stopped() {
@@ -978,6 +1042,8 @@ mod tests {
         let option = "[2026-10-17 09:17:28] GameAction [AppID 1574820, ActionID 4] : LaunchApp waiting for user response to ShowLaunchOption \"\"\n";
         assert_eq!(pending_interstitial(&[waiting, continues, option].concat()), Some((1574820, "ShowLaunchOption")));
         assert_eq!(pending_interstitial(&[waiting, continues].concat()), None, "Steam logs every launch's interstitial step, and continues at once");
+        let sync = "[2026-11-05 00:06:06] GameAction [AppID 250820, ActionID 1] : LaunchApp waiting for user response to SynchronizingCloud \"syncfailed\"\n";
+        assert_eq!(pending_interstitial(sync), Some((250820, "SynchronizingCloud")), "Steam's cloud sync failed dialog");
         assert_eq!(pending_interstitial(other), None);
         assert_eq!(pending_interstitial(""), None);
     }
@@ -1170,6 +1236,46 @@ mod tests {
         assert_eq!(env_mismatches(b"A=1\0B=9\0C=3", &want), ["B=2 but has 9"]);
         // a non-UTF-8 entry elsewhere must not hide a match or a mismatch
         assert_eq!(env_mismatches(b"JUNK=\xff\xfe\0A=1\0B=2\0C=0", &want), ["C=3 but has 0"]);
+    }
+
+    /// A temp steamvr.vrsettings holding `json`.
+    fn vrsettings(name: &str, json: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("SteamVrMcp-steamvr-{name}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("steamvr.vrsettings"), json).unwrap();
+        dir.join("steamvr.vrsettings")
+    }
+
+    #[test]
+    fn a_block_written_during_the_wait_fails_at_once() {
+        let file = vrsettings("block-wait", "{}");
+        let mut polls = 0;
+        let answered = || {
+            polls += 1;
+            if polls == 3 {
+                fs::write(&file, r#"{"driver_alvr_server":{"blocked_by_safe_mode":true}}"#).unwrap();
+            }
+            false
+        };
+        let began = Instant::now();
+        let e = wait_alvr(Some(&file), None, 0, None, Duration::from_secs(30), "; then retry", answered).unwrap_err();
+        assert_eq!(e.to_string(), format!("{ALVR_BLOCKED}; then retry"));
+        assert!(began.elapsed() < Duration::from_secs(2), "{:?}", began.elapsed());
+        fs::remove_dir_all(file.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn an_answering_alvr_beats_a_stale_block() {
+        let file = vrsettings("block-stale", r#"{"driver_alvr_server":{"blocked_by_safe_mode":true}}"#);
+        assert!(wait_alvr(Some(&file), None, 0, None, Duration::from_secs(5), "", || true).unwrap());
+        fs::remove_dir_all(file.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn another_drivers_block_does_not_fail_the_wait() {
+        let file = vrsettings("block-other", r#"{"driver_lighthouse":{"blocked_by_safe_mode":true}}"#);
+        assert!(!wait_alvr(Some(&file), None, 0, None, Duration::from_millis(300), "", || false).unwrap());
+        fs::remove_dir_all(file.parent().unwrap()).ok();
     }
 
     #[test]

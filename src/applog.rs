@@ -62,20 +62,23 @@ pub fn read_new(path: &Path, tail: &mut Tail) -> io::Result<Vec<String>> {
     file.seek(SeekFrom::Start(tail.offset))?;
     let mut bytes = std::mem::take(&mut tail.partial);
     tail.offset += file.take(MAX_READ).read_to_end(&mut bytes)? as u64;
-    let decode = |l: &[u8]| String::from_utf8_lossy(l.strip_suffix(b"\r").unwrap_or(l)).into_owned();
     let mut lines = vec![];
     if let Some(last) = bytes.iter().rposition(|&b| b == b'\n') {
         tail.partial = bytes.split_off(last + 1);
         bytes.pop();
-        lines = bytes.split(|&b| b == b'\n').map(decode).collect();
+        lines = bytes.split(|&b| b == b'\n').map(decode_line).collect();
     } else {
         tail.partial = bytes;
     }
     if tail.partial.len() > MAX_PARTIAL {
         tail.partial.truncate(MAX_PARTIAL);
-        lines.push(decode(&std::mem::take(&mut tail.partial)));
+        lines.push(decode_line(&std::mem::take(&mut tail.partial)));
     }
     Ok(lines)
+}
+
+fn decode_line(l: &[u8]) -> String {
+    String::from_utf8_lossy(l.strip_suffix(b"\r").unwrap_or(l)).into_owned()
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -157,15 +160,19 @@ impl App {
             }
         }
         for (file, text) in new {
-            if self.lines.len() == LINES_KEPT {
-                self.lines.pop_front();
-            }
-            self.lines.push_back(AppLine { seq: self.next_seq, t_s, at: clock::at(t_s), file, text });
-            self.next_seq += 1;
+            self.keep(t_s, file, text);
         }
         self.files = files;
         // An unresolved app has no files yet; priming now would read them from the start once it resolves.
         self.primed = self.info.is_some();
+    }
+
+    fn keep(&mut self, t_s: f64, file: String, text: String) {
+        if self.lines.len() == LINES_KEPT {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(AppLine { seq: self.next_seq, t_s, at: clock::at(t_s), file, text });
+        self.next_seq += 1;
     }
 }
 
@@ -204,6 +211,32 @@ impl AppLogs {
         }
     }
 
+    /// The seq the app's next line gets; 0 for an app not in `[app_logs]`.
+    pub fn next_seq(&self, app_id: u32) -> u64 {
+        self.apps.get(&app_id).map_or(0, |a| a.next_seq)
+    }
+
+    /// Bytes read so far from the app's files, an unfinished last line included: it moves with every byte a writer adds.
+    pub fn bytes_read(&self, app_id: u32) -> u64 {
+        self.apps.get(&app_id).map_or(0, |a| a.tails.values().map(|t| t.offset).sum())
+    }
+
+    /// Commits each file's unfinished last line, for a game that exited without its newline. The offset stays,
+    /// so bytes a still-running writer adds later start a new line: such a line shows split in two.
+    pub fn flush_partial(&mut self, app_id: u32) {
+        let Some(app) = self.apps.get_mut(&app_id) else { return };
+        let t_s = clock::now_s();
+        let partials: Vec<_> = app
+            .tails
+            .iter_mut()
+            .filter(|(_, t)| !t.partial.is_empty())
+            .map(|(path, t)| (path.display().to_string(), decode_line(&std::mem::take(&mut t.partial))))
+            .collect();
+        for (file, text) in partials {
+            app.keep(t_s, file, text);
+        }
+    }
+
     /// Forgets the app's lines (seq keeps growing) and skips what its files hold now.
     pub fn reset(&mut self, app_id: u32, steam_dir: Option<&Path>) {
         if let Some(app) = self.apps.get_mut(&app_id) {
@@ -215,11 +248,17 @@ impl AppLogs {
         self.poll_app(app_id, steam_dir);
     }
 
-    /// Up to `PAGE` lines with `seq >= since_seq`, oldest first.
-    pub fn page(&self, app_id: u32, since_seq: u64) -> Result<Page, String> {
+    /// Up to `limit` lines with `seq >= since_seq` that contain `contains` (ignoring case), oldest first.
+    pub fn page(&self, app_id: u32, since_seq: u64, contains: Option<&str>, limit: usize) -> Result<Page, String> {
         let app = self.apps.get(&app_id).ok_or_else(|| format!("app {app_id} has no entry in [app_logs]"))?;
-        let lines: Vec<AppLine> = app.lines.iter().filter(|l| l.seq >= since_seq).take(PAGE).cloned().collect();
-        let next_seq = lines.last().map_or(app.next_seq.max(since_seq), |l| l.seq + 1);
+        let contains = contains.map(str::to_lowercase);
+        let kept = |l: &&AppLine| l.seq >= since_seq && contains.as_ref().is_none_or(|c| l.text.to_lowercase().contains(c));
+        let lines: Vec<AppLine> = app.lines.iter().filter(kept).take(limit).cloned().collect();
+        // a short page scanned every line kept, so the next read starts after the newest
+        let next_seq = match lines.last() {
+            Some(l) if lines.len() == limit => l.seq + 1,
+            _ => app.next_seq.max(since_seq),
+        };
         Ok(Page { app_id, files: app.files.iter().map(|p| p.display().to_string()).collect(), lines, next_seq })
     }
 }
@@ -260,7 +299,7 @@ mod tests {
     }
 
     fn texts(logs: &AppLogs, since: u64) -> Vec<String> {
-        logs.page(42, since).unwrap().lines.into_iter().map(|l| l.text).collect()
+        logs.page(42, since, None, PAGE).unwrap().lines.into_iter().map(|l| l.text).collect()
     }
 
     #[test]
@@ -319,7 +358,7 @@ mod tests {
         append(&install.join("old.log"), "y\n");
         fs::write(install.join("z-new.log"), "z\n").unwrap();
         logs.poll(Some(&steam));
-        let page = logs.page(42, 0).unwrap();
+        let page = logs.page(42, 0, None, PAGE).unwrap();
         assert_eq!(page.lines.iter().map(|l| (l.seq, l.text.as_str())).collect::<Vec<_>>(), [(1, "y"), (2, "z")]);
         assert_eq!(page.files, [install.join("old.log"), install.join("z-new.log")].map(|p| p.display().to_string()));
         assert_eq!(page.lines[1].file, install.join("z-new.log").display().to_string());
@@ -349,7 +388,7 @@ mod tests {
         logs.poll(Some(&steam));
         append(&install.join("logs/a.log"), "1\n");
         logs.poll(Some(&steam));
-        let page = logs.page(42, 0).unwrap();
+        let page = logs.page(42, 0, None, PAGE).unwrap();
         assert_eq!(page.lines.iter().map(|l| (l.text.as_str(), l.file.clone())).collect::<Vec<_>>(), [("1", install.join("logs/a.log").display().to_string())]);
         assert_eq!(page.files, [install.join("logs/a.log").display().to_string()], "the first path in path order");
         fs::remove_dir_all(&steam).ok();
@@ -361,15 +400,15 @@ mod tests {
         logs.poll(Some(&steam));
         fs::write(install.join("a.log"), "1\n2\n").unwrap();
         logs.poll(Some(&steam));
-        assert_eq!(logs.page(42, 0).unwrap().lines.iter().map(|l| l.seq).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(logs.page(42, 0, None, PAGE).unwrap().lines.iter().map(|l| l.seq).collect::<Vec<_>>(), [1, 2]);
         append(&install.join("a.log"), "unread\n");
         logs.reset(42, Some(&steam));
         assert!(texts(&logs, 0).is_empty());
         append(&install.join("a.log"), "3\n");
         logs.poll(Some(&steam));
-        let page = logs.page(42, 0).unwrap();
+        let page = logs.page(42, 0, None, PAGE).unwrap();
         assert_eq!(page.lines.iter().map(|l| (l.seq, l.text.as_str())).collect::<Vec<_>>(), [(3, "3")]);
-        assert!(logs.page(7, 0).is_err());
+        assert!(logs.page(7, 0, None, PAGE).is_err());
         fs::remove_dir_all(&steam).ok();
     }
 
@@ -380,17 +419,51 @@ mod tests {
         let write = |range: std::ops::Range<u32>| range.map(|n| format!("l{n}\n")).collect::<String>();
         append(&install.join("a.log"), &write(1..1201));
         logs.poll(Some(&steam));
-        let first = logs.page(42, 0).unwrap();
+        let first = logs.page(42, 0, None, PAGE).unwrap();
         assert_eq!((first.lines.len(), first.next_seq), (PAGE, 501));
-        let second = logs.page(42, 501).unwrap();
+        let second = logs.page(42, 501, None, PAGE).unwrap();
         assert_eq!((second.lines[0].seq, second.lines[0].text.as_str(), second.next_seq), (501, "l501", 1001));
-        assert_eq!(logs.page(42, 1201).unwrap().next_seq, 1201);
-        assert_eq!(logs.page(42, 9000).unwrap().next_seq, 9000, "a future cursor stays where it is");
+        assert_eq!(logs.page(42, 1201, None, PAGE).unwrap().next_seq, 1201);
+        assert_eq!(logs.page(42, 9000, None, PAGE).unwrap().next_seq, 9000, "a future cursor stays where it is");
         append(&install.join("a.log"), &write(1201..5101));
         logs.poll(Some(&steam));
-        let kept = logs.page(42, 0).unwrap();
+        let kept = logs.page(42, 0, None, PAGE).unwrap();
         assert_eq!((kept.lines[0].seq, kept.next_seq), (5100 - LINES_KEPT as u64 + 1, 5100 - LINES_KEPT as u64 + 1 + PAGE as u64));
-        assert_eq!(logs.page(42, 5100).unwrap().lines[0].text, "l5100");
+        assert_eq!(logs.page(42, 5100, None, PAGE).unwrap().lines[0].text, "l5100");
+        fs::remove_dir_all(&steam).ok();
+    }
+
+    #[test]
+    fn page_filters_by_contains_and_limit() {
+        let (steam, install, mut logs) = game("filter", &["${install}/a.log"]);
+        logs.poll(Some(&steam));
+        append(&install.join("a.log"), "a\n[input] x\nb\n[INPUT] y\nc\n[input] z\nd\n");
+        logs.poll(Some(&steam));
+        let texts = |p: &Page| p.lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>();
+        let first = logs.page(42, 0, Some("[input]"), 2).unwrap();
+        assert_eq!((texts(&first), first.next_seq), (vec!["[input] x".into(), "[INPUT] y".into()], 5), "ignores case, stops at the limit");
+        let rest = logs.page(42, first.next_seq, Some("[input]"), 2).unwrap();
+        assert_eq!((texts(&rest), rest.next_seq), (vec!["[input] z".to_string()], 8), "next_seq passes the unmatched tail");
+        assert_eq!(logs.page(42, 0, Some("nothing"), 2).unwrap().next_seq, 8);
+        assert_eq!(logs.page(42, 0, None, 3).unwrap().next_seq, 4);
+        fs::remove_dir_all(&steam).ok();
+    }
+
+    #[test]
+    fn flush_partial_commits_the_unfinished_line_once() {
+        let (steam, install, mut logs) = game("flush", &["${install}/a.log"]);
+        logs.poll(Some(&steam));
+        append(&install.join("a.log"), "done\nhalf");
+        logs.poll(Some(&steam));
+        assert_eq!(texts(&logs, 0), ["done"]);
+        logs.flush_partial(42);
+        assert_eq!((texts(&logs, 0), logs.next_seq(42)), (vec!["done".to_string(), "half".into()], 3));
+        logs.flush_partial(42);
+        assert_eq!((texts(&logs, 0).len(), logs.next_seq(42)), (2, 3), "nothing left to commit");
+        append(&install.join("a.log"), "-rest\n");
+        logs.poll(Some(&steam));
+        assert_eq!(texts(&logs, 0), ["done", "half", "-rest"], "bytes after the flush start a new line");
+        assert_eq!(logs.next_seq(7), 0);
         fs::remove_dir_all(&steam).ok();
     }
 

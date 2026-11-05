@@ -227,8 +227,17 @@ pub struct StopReport {
     pub remaining_processes: Vec<String>,
     /// Pids and groups of the `launch_app via proton` game that vr_stop ended before SteamVR.
     pub stopped_app: Vec<u32>,
+    /// True when vr_stop asked the Steam vr_start started to exit and no Steam process is left, also when Steam had already exited.
     pub closed_steam: bool,
+    /// Whether SteamVR needed signals.
     pub used_signals: bool,
+    /// Names of the Steam processes still alive after that, zombies left out; a later vr_stop tries again only while the recorded client lives.
+    pub remaining_steam: Vec<String>,
+    /// Whether the Steam client vr_start started outlived -shutdown and got SIGTERM; no other Steam process is ever signalled.
+    pub signalled_steam: bool,
+    /// Why Steam may still run: the forwarded -shutdown failed, the Steam client this MCP started had already exited
+    /// (and the Steam running now was left alone), or Steam outlived this stop with no client kept for a later one.
+    pub steam_note: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -245,7 +254,7 @@ pub struct StatusReport {
     pub warning: Option<String>,
     /// The last SteamVR restart that failed, also one the supervisor ran: "<age> s ago: <reason>".
     pub last_restart_error: Option<String>,
-    /// Session clock: seconds since MCP start, and the same instant and T0 as RFC 3339 UTC.
+    /// Session clock: wall-clock seconds since MCP start (a stepped system clock moves it), and the same instant and T0 as RFC 3339 UTC.
     pub now_t_s: f64,
     pub now_at: String,
     pub t0_at: String,
@@ -420,6 +429,10 @@ pub struct ReadAppLogArgs {
     pub app_id: String,
     /// Only lines with seq at or above this (default 0); pass the next_seq of the last read.
     pub since_seq: Option<u64>,
+    /// Keep only lines whose text contains this, ignoring case.
+    pub contains: Option<String>,
+    /// How many of the oldest matching lines to return, 1 to 500 (default 500).
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
@@ -460,6 +473,9 @@ const LOG_SOURCES: [&str; 5] = ["alvr", "vrserver", "vrcompositor", "vrmonitor",
 const STEAMVR_LOGS: [&str; 3] = ["vrserver", "vrcompositor", "vrmonitor"];
 /// ALVR events kept, and SteamVR lines read per log.
 const LOGS_KEPT: usize = 1000;
+
+/// How long a log wait keeps reading files that still grow after the app exited, before it fails.
+const LOG_DRAIN: Duration = Duration::from_secs(2);
 /// ALVR statistics summaries kept: ALVR sends one every 500 ms, so two of get_frame_timing's longest (60 s) windows.
 const STATS_KEPT: usize = 240;
 
@@ -635,6 +651,7 @@ struct State {
     headset: Option<Headset>,
     dashboard: Option<Child>,
     started_steam: bool,
+    steam_client: Option<(u32, u64)>,
     restarts: u32,
     watchdog: Watchdog,
     leaked: bool,
@@ -645,7 +662,7 @@ struct State {
     stopping: u32,
     /// Why the session ended without vr_stop, for vr_status; cleared by vr_start and vr_stop.
     ended: Option<&'static str>,
-    /// When and why the last SteamVR restart failed.
+    /// When and why the last SteamVR restart failed; cleared by a restart that works, a vr_start that works and vr_stop.
     last_restart_error: Option<(Instant, String)>,
     /// The last `launch_app via proton` run, until stop_app ends it.
     launched: Option<proton::Launched>,
@@ -675,7 +692,7 @@ pub struct Stack {
     /// while the reader lock is held, an earlier call hangs (a wedged vrserver).
     openvr_calls: Arc<AtomicUsize>,
     on_change: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-    /// The poses every headset sends; outlives headset restarts. Locked only briefly.
+    /// The poses every headset sends; outlives headset restarts, and vr_start resets it when it begins a session. Locked only briefly.
     rig: Arc<Mutex<Rig>>,
     /// The newest LOGS_KEPT ALVR log events the supervisor saw, oldest first. Locked only briefly.
     alvr_logs: Mutex<VecDeque<LogLine>>,
@@ -710,6 +727,12 @@ pub fn stop_guard(steamvr_running: bool, alvrs: impl FnOnce() -> bool) -> Result
         bail!("SteamVR is running without ALVR; close it yourself");
     }
     Ok(())
+}
+
+/// Whether vr_stop may end a running SteamVR as this MCP's. A failed start's dashboard proves this MCP launched it only
+/// together with ALVR's safe-mode block: that SteamVR has no ALVR to answer, and the start's error said to run vr_stop.
+fn stop_is_ours(managing: bool, started_steam: bool, dashboard: bool, alvr_blocked: impl FnOnce() -> bool) -> bool {
+    managing || started_steam || (dashboard && alvr_blocked())
 }
 
 /// An ALVR answering while none of this user's vrservers runs belongs to someone else (another user's SteamVR):
@@ -776,7 +799,7 @@ impl Stack {
             rig: Arc::default(),
             alvr_logs: Mutex::default(),
             alvr_stats: Mutex::default(),
-            lease: Mutex::new((format!("mcp-{}", std::process::id()), lease::DEFAULT_TTL)),
+            lease: Mutex::new(default_lease()),
             app_logs: Mutex::new(AppLogs::new(&app_log_patterns)),
             vr,
         });
@@ -894,7 +917,7 @@ impl Stack {
         lease::acquire(&dir, &owner, ttl).map(drop)
     }
 
-    /// vr_acquire: takes or renews the lease under `owner`, which later claims keep using.
+    /// vr_acquire: takes or renews the lease under `owner` and `ttl_s`, which later claims keep using until the lease is released.
     pub fn acquire_lease(&self, owner: String, ttl_s: Option<u64>) -> Result<Lease> {
         if !(1..=64).contains(&owner.chars().count()) {
             bail!("owner must be from 1 to 64 characters, got {}", owner.chars().count());
@@ -909,9 +932,11 @@ impl Stack {
         Ok(taken)
     }
 
-    /// Whether this MCP held the lease.
+    /// Whether this MCP held the lease. Forgets vr_acquire's owner name and ttl, so the next claim is the MCP's own.
     pub fn release_lease(&self) -> Result<bool> {
-        lease::release(&self.paths().runtime_dir)
+        let released = lease::release(&self.paths().runtime_dir)?;
+        *self.lease.lock() = default_lease();
+        Ok(released)
     }
 
     /// vr_release: gives up our lease, unless this MCP still runs something on SteamVR: the next
@@ -1335,7 +1360,13 @@ impl Stack {
                 bail!("{e:#}; run vr_stop to free SteamVR");
             }
         }
-        started.map(|report| StartReport { dashboard_visible: self.dashboard_visible(), ..report })
+        started.map(|r| self.finish_start(r))
+    }
+
+    /// A start that succeeded, also one that found a stream: an older restart failure no longer applies.
+    fn finish_start(&self, report: StartReport) -> StartReport {
+        self.state.lock().last_restart_error = None;
+        StartReport { dashboard_visible: self.dashboard_visible(), ..report }
     }
 
     /// Err once a vr_stop ran since `epoch`, State::stops when the vr_start began.
@@ -1356,12 +1387,22 @@ impl Stack {
         Ok(state.restarts)
     }
 
-    /// The error of a vr_start that vr_stop ended. After a launch it first lets Steam's hand-off start SteamVR, so the stop that waits for this start finds it.
-    fn stopped_start(&self, launched: Option<Instant>) -> alvr_common::anyhow::Error {
+    /// The error of a vr_start that vr_stop ended. After a launch it first lets Steam's hand-off start SteamVR, so the stop that waits for this start finds it,
+    /// and the Steam client this start started (`started_steam`).
+    fn stopped_start(&self, launched: Option<Instant>, started_steam: bool) -> alvr_common::anyhow::Error {
         if let Some(t) = launched {
             self.vr.settle(t);
         }
+        if started_steam {
+            self.record_steam_client();
+        }
         anyhow!("failed: vr_stop ended the session")
+    }
+
+    /// Keeps the running Steam client for vr_stop, after this MCP started Steam: Steam runs one instance, so it is ours.
+    /// None found drops an older record: launch() started Steam only because none ran, so that client is gone.
+    fn record_steam_client(&self) {
+        self.state.lock().steam_client = steamvr::steam_client();
     }
 
     fn start_inner(&self, epoch: u64, no_restart: alvr_common::parking_lot::MutexGuard<'_, ()>) -> Result<StartReport> {
@@ -1386,6 +1427,11 @@ impl Stack {
                 }
             }
         }
+        // a new session starts from the defaults; an already-streaming vr_start returned above, and restarts never come here
+        self.rig.lock().reset();
+        if cfg!(test) {
+            bail!("unit tests never start a headset"); // a second ALVR client, and setup on the user's real files
+        }
         let steamvr_running = steamvr::is_steamvr_running();
         let up = headset_up(steamvr_running);
         // ClientCoreContext::new writes the client session.json that client_hostname reads, so a client exists first
@@ -1407,7 +1453,7 @@ impl Stack {
         if !steamvr_running {
             foreign_alvr_guard(false, || self.api().ping(), self.api().port)?;
             if steamvr::has_leftovers(&self.vr.alive()) && !self.vr.kill() {
-                bail!("SteamVR processes still running after SIGKILL: {:?} (deadline {} s)", self.vr.alive(), self.vr.kill_wait.as_secs());
+                bail!("SteamVR processes still running after SIGKILL: {:?} (deadline {} s)", self.vr.alive(), (4 * self.vr.kill_wait).as_secs());
             }
             // nothing runs, so SteamVR no longer rewrites the file; a crash or kill left blocks behind
             if setup::refresh_stale_snapshot(&self.paths())? {
@@ -1457,7 +1503,7 @@ impl Stack {
             handed = (!report.started_steam).then_some(STEAMVR_URL);
         }
 
-        self.begin_managing(epoch).map_err(|_| self.stopped_start(launched))?;
+        self.begin_managing(epoch).map_err(|_| self.stopped_start(launched, report.started_steam))?;
         drop(no_restart);
         let stopped = || self.check_stop(epoch).is_err();
         let (mut seen, mut exited) = (Vec::new(), None);
@@ -1465,11 +1511,16 @@ impl Stack {
             exited = self.vr_exited(&mut seen);
             stopped() || exited.is_some() || self.api().ping()
         };
-        if !steamvr::wait_launched(steam_dir, log_from, handed, left(), answered)? {
+        // start() adds its own vr_stop advice to a block
+        let waited = steamvr::wait_alvr(paths.vrsettings_file().as_deref(), steam_dir, log_from, handed, left(), "", answered);
+        if report.started_steam {
+            self.record_steam_client(); // Steam is up by now, whatever the wait found
+        }
+        if !waited? {
             bail!("ALVR server did not answer on port {} (deadline {} s)", self.api().port, timeout.as_secs());
         }
         if stopped() {
-            return Err(self.stopped_start(launched));
+            return Err(self.stopped_start(launched, report.started_steam));
         }
         if let Some(name) = exited {
             bail!("failed: {name} exited before ALVR answered");
@@ -1545,18 +1596,21 @@ impl Stack {
     }
 
     pub fn stop(&self) -> Result<StopReport> {
-        let ours = {
+        let (managing, started_steam, dashboard) = {
             let state = self.state.lock();
-            state.managing || state.started_steam
+            (state.managing, state.started_steam, state.dashboard.is_some())
         };
+        let blocked = || self.paths().vrsettings_file().is_some_and(|f| setup::alvr_blocked(&f));
+        let ours = || stop_is_ours(managing, started_steam, dashboard, blocked);
         // the Stack's VrProcs: a unit test never sees the user's SteamVR
-        stop_guard(self.vr.vrserver_running(), || ours || self.api().ping() || steamvr::vrserver_has_alvr())?;
+        stop_guard(self.vr.vrserver_running(), || ours() || self.api().ping() || steamvr::vrserver_has_alvr())?;
         {
             let mut state = self.state.lock();
             state.managing = false;
             state.stops += 1;
             state.stopping += 1;
             state.ended = None;
+            state.last_restart_error = None;
         }
         // an in-flight vr_start bails at its next check; what it left (headset, dashboard, the SteamVR it launched) goes below
         let _no_start = self.starting.lock();
@@ -1585,20 +1639,52 @@ impl Stack {
             setup::undo_safe_mode_blocks(&self.paths()).map_err(|e| error!("{e:#}")).ok();
         }
 
-        let (dashboard, started_steam) = {
+        let (dashboard, started_steam, client) = {
             let mut state = self.state.lock();
-            (state.dashboard.take(), std::mem::take(&mut state.started_steam))
+            (state.dashboard.take(), std::mem::take(&mut state.started_steam), state.steam_client.take())
         };
         if let Some(mut child) = dashboard {
             child.kill().ok();
             child.wait().ok();
         }
-        if started_steam {
-            if steamvr::is_steam_running() {
-                steamvr::launch(&self.cfg(), "-shutdown")?; // Steam is running, so this only forwards -shutdown
+        let client_alive = |c: (u32, u64)| !steamvr::survivors(&[c], steamvr::stat).is_empty();
+        let live = client.filter(|&c| client_alive(c));
+        let mut notes = Vec::new();
+        // a dead record leaves Steam alone: the Steam running now is not the one vr_start started
+        let dead_record = client.is_some() && live.is_none();
+        if started_steam || client.is_some() {
+            let mut kept = None;
+            if !dead_record {
+                // self.vr's first Steam name is the client (`steam`); a unit test's is a fake, and launch() refuses there
+                if self.vr.steam.first().is_some_and(|n| steamvr::has_live(n)) {
+                    // Steam is running, so this only forwards -shutdown
+                    if let Err(e) = steamvr::launch(&self.cfg(), "-shutdown") {
+                        notes.push(format!("forwarding -shutdown to Steam failed: {e:#}"));
+                    }
+                }
+                let gone = || self.vr.live_steam().is_empty();
+                // after an online session Steam can ignore -shutdown for 40 s or more; SIGTERM ends its client in seconds
+                if !steamvr::wait_for(self.vr.steam_wait, gone) && let Some((pid, _)) = live.filter(|&c| client_alive(c)) {
+                    steamvr::terminate(pid, libc::SIGTERM);
+                    report.signalled_steam = true;
+                    steamvr::wait_for(self.vr.steam_term_wait, gone);
+                }
+                // only the recorded client, while it lives, carries over: a Steam started later is the user's
+                kept = live.filter(|&c| client_alive(c));
+                self.state.lock().steam_client = kept;
             }
-            report.closed_steam = steamvr::wait_gone(&["steam"], Duration::from_secs(60));
+            let left = self.vr.live_steam();
+            report.closed_steam = left.is_empty();
+            report.remaining_steam = left.iter().map(|n| n.to_string()).collect();
+            if !left.is_empty() && kept.is_none() {
+                notes.push(if dead_record {
+                    "the Steam client this MCP started has exited, perhaps restarted by Steam itself; the Steam running now was left alone".into()
+                } else {
+                    "Steam is still running and this MCP recorded no client of it, so no later vr_stop will close it".into()
+                });
+            }
         }
+        report.steam_note = (!notes.is_empty()).then(|| notes.join("; "));
         report.remaining_processes = self.vr.remaining(&snapshot);
         self.release_if_clean(&report);
         Ok(report)
@@ -1867,13 +1953,19 @@ impl Stack {
     /// The app's log lines from `since_seq`, after reading what its files gained.
     pub fn read_app_log(&self, a: ReadAppLogArgs) -> Result<applog::Page> {
         let id = app_id(&a.app_id)?;
+        let limit = a.limit.unwrap_or(applog::PAGE);
+        if !(1..=applog::PAGE).contains(&limit) {
+            bail!("limit must be 1 to {}", applog::PAGE);
+        }
         let steam = self.paths().steam_dir;
         let mut logs = self.app_logs.lock();
         logs.poll_app(id, steam.as_deref());
-        logs.page(id, a.since_seq.unwrap_or(0)).map_err(|e| anyhow!(e))
+        logs.page(id, a.since_seq.unwrap_or(0), a.contains.as_deref(), limit).map_err(|e| anyhow!(e))
     }
 
-    /// Polls the app's logs every 200 ms until a line matches `fail_pattern` or `pattern`, or the timeout passes.
+    /// Polls the app's logs every 200 ms until a line matches `fail_pattern` or `pattern`, or the timeout passes. Once the app
+    /// exits it reads every 50 ms until two reads in a row add no byte (at most LOG_DRAIN, which can run past the timeout), counts an
+    /// unfinished last line, then fails.
     pub fn wait_for_log(&self, a: WaitForLogArgs) -> Result<Value> {
         let (id, pattern, fail, timeout) = wait_plan(&a, |id| self.app_logs.lock().has_app(id)).map_err(|e| anyhow!(e))?;
         let deadline = Instant::now() + timeout;
@@ -1882,13 +1974,34 @@ impl Stack {
         // shortcut: the scene may be another app than `id`, compare the scene's app key if two apps run at once
         let scene = self.scene_app().filter(|s| s.state == "running");
         let scene = game_pid(scene.as_ref(), steamvr::process_name).ok().map(|pid| (pid, steamvr::comm(pid)));
+        let mut exited: Option<(String, Instant)> = None;
+        let mut quiet = 0;
         loop {
+            // sampled before the read, so a line written before the exit is always read after it
+            if exited.is_none() {
+                let launcher = launcher.as_ref().and_then(|e| *e.lock());
+                let alive = |pid| steamvr::comm(pid) == scene.as_ref().and_then(|s| s.1.clone());
+                exited = app_exited(launcher, scene.as_ref().map(|s| s.0), alive).map(|why| (why, Instant::now() + LOG_DRAIN));
+            }
+            // checked before the read, so that read still sees the writer's last bytes
+            let drain_over = exited.as_ref().is_some_and(|(_, until)| Instant::now() >= *until);
             let steam = self.paths().steam_dir;
             let hit = {
                 let mut logs = self.app_logs.lock();
+                // bytes, not lines: a last line still being written is activity
+                let mark = |logs: &AppLogs| (logs.next_seq(id), logs.bytes_read(id));
+                let before = mark(&logs);
                 logs.poll_app(id, steam.as_deref());
-                loop {
-                    let page = logs.page(id, cursor).map_err(|e| anyhow!(e))?;
+                let grew = mark(&logs) != before;
+                // counted from the exit; one quiet read is too few, a child may write a line in pieces
+                quiet = if grew || exited.is_none() { 0 } else { quiet + 1 };
+                // a writer still adding to the line at LOG_DRAIN has run past the bound, so a split there is accepted
+                if quiet >= 2 || drain_over {
+                    logs.flush_partial(id);
+                }
+                // scanned every round: the ring evicts past LINES_KEPT before a long drain ends
+                let hit = loop {
+                    let page = logs.page(id, cursor, None, applog::PAGE).map_err(|e| anyhow!(e))?;
                     cursor = page.next_seq;
                     if let Some((result, line)) = applog::find_match(&page.lines, &pattern, fail.as_ref()) {
                         break Some((result, line.clone()));
@@ -1896,14 +2009,18 @@ impl Stack {
                     if page.lines.len() < applog::PAGE {
                         break None;
                     }
-                }
+                };
+                hit
             };
             if let Some((result, line)) = hit {
                 return Ok(serde_json::json!({ "result": result, "line": line, "next_seq": line.seq + 1 }));
             }
-            let launcher = launcher.as_ref().and_then(|e| *e.lock());
-            if let Some(why) = app_exited(launcher, scene.as_ref().map(|s| s.0), |pid| steamvr::comm(pid) == scene.as_ref().and_then(|s| s.1.clone())) {
-                bail!("app {id}: failed: app exited ({why}) before a line matched");
+            if let Some((why, _)) = &exited {
+                if quiet >= 2 || drain_over {
+                    bail!("app {id}: failed: app exited ({why}) before a line matched");
+                }
+                thread::sleep(Duration::from_millis(50));
+                continue;
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -2024,6 +2141,9 @@ impl Stack {
         let mut started_steam = false;
         let stopped = || !self.state.lock().managing;
         let restarted = steamvr::restart_steamvr(&self.cfg(), &self.paths(), &self.api(), &self.vr, timeout, stopped, &mut started_steam);
+        if started_steam {
+            self.record_steam_client();
+        }
         // after a vr_stop no client comes back: the stop waiting for this restart would have to dispose it
         let managing = self.state.lock().managing;
         let headset = match headset_step(managing, headset.is_some()) {
@@ -2068,6 +2188,11 @@ fn record_restart(state: &mut State, restarted: Result<()>) -> Result<()> {
             Err(e)
         }
     }
+}
+
+/// The owner name and ttl claims use until vr_acquire names others.
+fn default_lease() -> (String, Duration) {
+    (format!("mcp-{}", std::process::id()), lease::DEFAULT_TTL)
 }
 
 /// The API at the session's port, ALVR's default 8082 while no streamer is known.
@@ -2392,8 +2517,11 @@ mod tests {
         let file = stack.paths().vrsettings_file().unwrap();
         stack.claim().unwrap();
         stack.state.lock().managing = true; // passes stop_guard whatever SteamVR runs on this machine
+        stack.state.lock().started_steam = true;
         let report = stack.stop().unwrap();
         assert!(!report.used_signals && report.remaining_processes.is_empty(), "{report:?}");
+        // under test launch() refuses and its error lands in steam_note, so no note means no -shutdown was forwarded
+        assert!(report.closed_steam && report.steam_note.is_none(), "NONE sees no Steam, so it never forwards to the user's: {report:?}");
         assert!(setup::blocked_drivers(&file).is_empty());
         assert!(stack.status().owner.is_none(), "a finished stop gives up the lease");
         std::fs::remove_dir_all(&root).ok();
@@ -2410,7 +2538,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         let paths = Paths { steam_dir: None, flatpak_steam: false, steamvr_dir: None, streamer_dir: None, state_dir: root.join("state"), runtime_dir: root.join("run") };
         let names = Box::leak(Box::new([name]));
-        let procs = steamvr::VrProcs { names, grace: Duration::from_millis(grace_ms), kill_wait: Duration::from_millis(300) };
+        let procs = steamvr::VrProcs { names, grace: Duration::from_millis(grace_ms), kill_wait: Duration::from_millis(300), steam: &[], steam_wait: Duration::ZERO, steam_term_wait: Duration::ZERO };
         let stack = Stack::with_procs(Config::default(), paths, procs);
         stack.claim().unwrap();
         stack.state.lock().managing = true;
@@ -2469,6 +2597,191 @@ mod tests {
         zombie.wait().unwrap();
         stack.release_lease().unwrap();
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A stack whose stop() ends no VR process and waits 300 ms on the fake Steam `names`, with its lease in a temp dir.
+    fn fake_steam_stack(tag: &str, names: &[&'static str]) -> (Arc<Stack>, PathBuf) {
+        let root = std::env::temp_dir().join(format!("SteamVrMcp-stack-steam-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let paths = Paths { steam_dir: None, flatpak_steam: false, steamvr_dir: None, streamer_dir: None, state_dir: root.join("state"), runtime_dir: root.join("run") };
+        let steam: &'static [&'static str] = Box::leak(names.to_vec().into_boxed_slice());
+        let procs = steamvr::VrProcs { names: &[], grace: Duration::ZERO, kill_wait: Duration::from_millis(300), steam, steam_wait: Duration::from_millis(300), steam_term_wait: Duration::from_millis(300) };
+        (Stack::with_procs(Config::default(), paths, procs), root)
+    }
+
+    /// What stop() notes when it forwards -shutdown under test, where launch() refuses.
+    const FORWARD_NOTE: &str = "forwarding -shutdown to Steam failed: unit tests never run steam";
+
+    #[test]
+    fn vr_stop_without_a_record_asks_steam_once_and_keeps_nothing() {
+        let name = fake_name("webhelper");
+        let (stack, root) = fake_steam_stack("norecord", &[name]);
+        stack.state.lock().started_steam = true;
+        let pid = fake_vr(name, "while :; do sleep 0.1; done");
+        let start = steamvr::stat(pid).unwrap().1;
+        // under test launch() refuses, so -shutdown changes nothing and the fake stays
+        let report = stack.stop().unwrap();
+        assert!(!report.closed_steam && report.remaining_steam == [name] && !report.signalled_steam, "{report:?}");
+        assert!(report.steam_note.as_deref().is_some_and(|n| n.contains(FORWARD_NOTE) && n.contains("no later vr_stop")), "{report:?}");
+        {
+            let state = stack.state.lock();
+            assert!(!state.started_steam && state.steam_client.is_none());
+            assert!(!stop_is_ours(false, state.started_steam, false, || false), "a Steam left over never makes SteamVR ours");
+        }
+        let report = stack.stop().unwrap();
+        assert!(!report.closed_steam && report.remaining_steam.is_empty() && report.steam_note.is_none(), "skipped: {report:?}");
+        assert_eq!(steamvr::stat(pid).map(|(_, t)| t), Some(start), "never signalled");
+        steamvr::terminate(pid, libc::SIGKILL);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn vr_stop_signals_the_steam_client_vr_start_started() {
+        let (client_name, helper_name) = (fake_name("client"), fake_name("helper"));
+        let (stack, root) = fake_steam_stack("signal", &[client_name, helper_name]);
+        let client = fake_vr(client_name, "while :; do sleep 0.1; done");
+        fake_vr(helper_name, &format!("while kill -0 {client} 2>/dev/null; do sleep 0.1; done"));
+        {
+            let mut state = stack.state.lock();
+            (state.started_steam, state.steam_client) = (true, Some((client, steamvr::stat(client).unwrap().1)));
+        }
+        let report = stack.stop().unwrap();
+        assert!(report.signalled_steam && report.closed_steam && report.remaining_steam.is_empty() && report.steam_note.as_deref() == Some(FORWARD_NOTE), "{report:?}");
+        let state = stack.state.lock();
+        assert!(!state.started_steam && state.steam_client.is_none());
+        drop(state);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn vr_stop_leaves_a_steam_that_is_not_the_recorded_client_alone() {
+        let name = fake_name("other");
+        let (stack, root) = fake_steam_stack("other", &[name]);
+        let pid = fake_vr(name, "while :; do sleep 0.1; done");
+        let start = steamvr::stat(pid).unwrap().1;
+        {
+            let mut state = stack.state.lock();
+            (state.started_steam, state.steam_client) = (true, Some((pid, start + 1)));
+        }
+        let report = stack.stop().unwrap();
+        assert!(!report.signalled_steam && !report.closed_steam && report.remaining_steam == [name], "{report:?}");
+        assert!(report.steam_note.as_deref().is_some_and(|n| n.contains("left alone") && !n.contains("forwarding")), "{report:?}");
+        {
+            let state = stack.state.lock();
+            assert!(!state.started_steam && state.steam_client.is_none(), "the Steam vr_start started is gone; this one is the user's");
+        }
+        assert_eq!(steamvr::stat(pid).map(|(_, t)| t), Some(start), "never signalled");
+        steamvr::terminate(pid, libc::SIGKILL);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_webhelper_left_after_the_client_keeps_nothing() {
+        let (client_name, helper_name) = (fake_name("client2"), fake_name("helper2"));
+        let (stack, root) = fake_steam_stack("helper-left", &[client_name, helper_name]);
+        let client = fake_vr(client_name, "while :; do sleep 0.1; done");
+        let helper = fake_vr(helper_name, "while :; do sleep 0.1; done");
+        {
+            let mut state = stack.state.lock();
+            (state.started_steam, state.steam_client) = (true, Some((client, steamvr::stat(client).unwrap().1)));
+        }
+        let report = stack.stop().unwrap();
+        assert!(report.signalled_steam && !report.closed_steam && report.remaining_steam == [helper_name], "{report:?}");
+        assert!(report.steam_note.as_deref().is_some_and(|n| n.contains(FORWARD_NOTE) && n.contains("no later vr_stop")), "{report:?}");
+        {
+            let state = stack.state.lock();
+            assert!(!state.started_steam && state.steam_client.is_none());
+        }
+        let report = stack.stop().unwrap();
+        assert!(!report.signalled_steam && !report.closed_steam && report.remaining_steam.is_empty(), "skipped: {report:?}");
+        steamvr::terminate(helper, libc::SIGKILL);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn only_a_live_recorded_client_outlives_vr_stop() {
+        let name = fake_name("stubborn");
+        let (stack, root) = fake_steam_stack("stubborn", &[name]);
+        let marker = root.join("trapped");
+        std::fs::create_dir_all(&root).unwrap();
+        let client = fake_vr(name, &format!("trap '' TERM; touch {}; while :; do sleep 0.1; done", marker.display()));
+        assert!(steamvr::wait_for(Duration::from_secs(5), || marker.exists()), "TERM is ignored before stop() runs");
+        let record = (client, steamvr::stat(client).unwrap().1);
+        {
+            let mut state = stack.state.lock();
+            (state.started_steam, state.steam_client) = (true, Some(record));
+        }
+        let report = stack.stop().unwrap();
+        assert!(report.signalled_steam && !report.closed_steam && report.remaining_steam == [name] && report.steam_note.as_deref() == Some(FORWARD_NOTE), "{report:?}");
+        {
+            let state = stack.state.lock();
+            assert_eq!((state.started_steam, state.steam_client), (false, Some(record)), "the record is all that is kept");
+        }
+        let report = stack.stop().unwrap();
+        assert!(report.signalled_steam && report.remaining_steam == [name] && report.steam_note.as_deref() == Some(FORWARD_NOTE), "the next vr_stop tries again: {report:?}");
+        steamvr::terminate(client, libc::SIGKILL);
+        assert!(steamvr::wait_for(Duration::from_secs(2), || steamvr::stat(client).is_none()));
+        // the record a stop kept is dead, and the Steam running now is another one
+        let other = fake_vr(name, "while :; do sleep 0.1; done");
+        let report = stack.stop().unwrap();
+        assert!(!report.signalled_steam && !report.closed_steam && report.remaining_steam == [name], "{report:?}");
+        assert!(report.steam_note.as_deref().is_some_and(|n| n.contains("left alone") && !n.contains("forwarding")), "{report:?}");
+        assert_eq!(stack.state.lock().steam_client, None);
+        steamvr::terminate(other, libc::SIGKILL);
+        assert!(steamvr::wait_for(Duration::from_secs(2), || steamvr::stat(other).is_none()));
+        stack.state.lock().steam_client = Some(record);
+        let report = stack.stop().unwrap();
+        assert!(!report.signalled_steam && report.closed_steam && report.remaining_steam.is_empty() && report.steam_note.is_none(), "already quit: {report:?}");
+        assert_eq!(stack.state.lock().steam_client, None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_start_that_launched_steam_and_finds_no_client_drops_the_old_record() {
+        let (stack, root) = fake_steam_stack("rerecord", &[]);
+        // under test steam_client() finds none, as when Steam's client is not up yet or two run
+        stack.state.lock().steam_client = Some((1, 1));
+        stack.record_steam_client();
+        assert_eq!(stack.state.lock().steam_client, None, "launch() started Steam, so no older client is alive");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn kill_waits_for_the_earlier_names_before_the_last() {
+        let (a, b) = (fake_name("ka"), fake_name("kb"));
+        let marker = std::env::temp_dir().join(format!("SteamVrMcp-stack-kill-marker-{}", std::process::id()));
+        std::fs::remove_file(&marker).ok();
+        let first = fake_vr(a, &format!("trap '' TERM; touch {}; while :; do sleep 0.1; done", marker.display()));
+        assert!(steamvr::wait_for(Duration::from_secs(5), || marker.exists()), "TERM is ignored before kill() runs");
+        let last = fake_vr(b, "while :; do sleep 0.1; done");
+        let names: &'static [&'static str] = Box::leak(Box::new([a, b]));
+        let procs = steamvr::VrProcs { names, kill_wait: Duration::from_secs(1), ..steamvr::VrProcs::NONE };
+        let began = Instant::now();
+        let killing = thread::spawn(move || procs.kill());
+        thread::sleep(Duration::from_millis(500));
+        assert!(steamvr::stat(last).is_some(), "the last name waits for the earlier ones");
+        assert!(killing.join().unwrap());
+        assert!(steamvr::stat(first).is_none() && steamvr::stat(last).is_none());
+        assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
+        std::fs::remove_file(&marker).ok();
+    }
+
+    #[test]
+    fn kill_does_not_wait_on_an_earlier_zombie() {
+        let (a, b) = (fake_name("z"), fake_name("kz"));
+        // a zombie by comm: its cmdline is gone, and nothing reaps it until the end
+        let mut zombie = std::process::Command::new("sh").args(["-c", &format!("printf {a} > /proc/self/comm; while :; do sleep 0.1; done")]).spawn().unwrap();
+        let zpid = zombie.id();
+        assert!(steamvr::wait_for(Duration::from_secs(5), || steamvr::comm(zpid).as_deref() == Some(a)));
+        steamvr::terminate(zpid, libc::SIGKILL);
+        assert!(steamvr::wait_for(Duration::from_secs(5), || steamvr::stat(zpid).is_some_and(|(s, _)| s == 'Z')));
+        let last = fake_vr(b, "while :; do sleep 0.1; done");
+        let names: &'static [&'static str] = Box::leak(Box::new([a, b]));
+        let procs = steamvr::VrProcs { names, kill_wait: Duration::from_secs(1), ..steamvr::VrProcs::NONE };
+        let killing = thread::spawn(move || procs.kill());
+        assert!(steamvr::wait_for(Duration::from_millis(600), || steamvr::stat(last).is_none()), "the last name goes without waiting on the zombie");
+        killing.join().unwrap();
+        zombie.wait().ok();
     }
 
     #[test]
@@ -2543,6 +2856,20 @@ mod tests {
         assert_eq!(stack.acquire_lease("driver".into(), Some(600)).unwrap().owner, "driver");
         assert!(stack.release_lease().unwrap());
         assert!(stack.status().owner.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_release_forgets_the_holder_name_and_ttl() {
+        let dir = std::env::temp_dir().join(format!("SteamVrMcp-stack-lease-forget-{}", std::process::id()));
+        let stack = test_stack();
+        stack.paths.lock().runtime_dir = dir.clone();
+        stack.acquire_lease("driver".into(), Some(7200)).unwrap();
+        assert!(stack.release_lease().unwrap());
+        stack.claim().unwrap();
+        assert!(stack.status().owner.unwrap().lease.owner.starts_with("mcp-"), "the next claim is the MCP's own again");
+        assert_eq!(*stack.lease.lock(), default_lease());
+        stack.release_lease().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2657,6 +2984,44 @@ mod tests {
     }
 
     #[test]
+    fn vr_stop_clears_the_last_restart_error() {
+        let (stack, root) = blocked_stack("stop-restart-error", false);
+        {
+            let mut state = stack.state.lock();
+            (state.managing, state.last_restart_error) = (true, Some((Instant::now(), "boom".into())));
+        }
+        stack.stop().unwrap();
+        assert_eq!(stack.status().last_restart_error, None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_successful_start_clears_the_last_restart_error() {
+        let stack = test_stack();
+        stack.state.lock().last_restart_error = Some((Instant::now(), "boom".into()));
+        stack.finish_start(StartReport::default());
+        assert_eq!(stack.status().last_restart_error, None);
+    }
+
+    #[test]
+    fn vr_start_resets_the_rig_only_when_it_starts_a_session() {
+        let head_y = |stack: &Stack| {
+            let data = stack.rig.lock().tracking(Instant::now(), Duration::ZERO);
+            data.device_motions.iter().find(|(d, _)| *d == *alvr_common::HEAD_ID).unwrap().1.pose.position.y
+        };
+        let raise = |stack: &Stack| stack.apply(serde_json::from_value(serde_json::json!({ "action": "move_head", "args": { "offset": [0, 0.5, 0] } })).unwrap()).unwrap();
+        let stack = test_stack();
+        raise(&stack);
+        assert_eq!(stack.start().unwrap_err().to_string(), "ALVR streamer not found; set streamer_dir in config.toml");
+        assert_eq!(head_y(&stack), 2.1, "a refused start keeps the rig");
+        let stack = test_stack();
+        stack.paths.lock().streamer_dir = Some(std::env::temp_dir().join(format!("SteamVrMcp-stack-rig-reset-{}", std::process::id())));
+        raise(&stack);
+        assert_eq!(stack.start().unwrap_err().to_string(), "unit tests never start a headset");
+        assert_eq!(head_y(&stack), 1.6, "a start that begins a session starts from the defaults");
+    }
+
+    #[test]
     fn vr_stop_waits_for_an_in_flight_vr_start_to_bail() {
         let (stack, root) = blocked_stack("stop-start", false);
         let epoch = stack.state.lock().stops;
@@ -2737,6 +3102,20 @@ mod tests {
         assert!(stop_guard(true, || true).is_ok());
         assert!(stop_guard(false, || panic!("not asked while SteamVR is down")).is_ok());
         assert!(!steamvr::VrProcs::NONE.vrserver_running(), "a test stack's stop never sees the user's vrserver");
+    }
+
+    #[test]
+    fn vr_stop_owns_a_failed_start_that_left_its_dashboard() {
+        assert!(!stop_is_ours(false, false, false, || panic!("no dashboard: the file is not read")));
+        assert!(!stop_is_ours(false, false, true, || false), "a dashboard alone: SteamVR may be the user's");
+        assert!(stop_is_ours(false, false, true, || true), "its dashboard and ALVR's block: our failed start");
+        assert!(stop_is_ours(true, false, false, || false) && stop_is_ours(false, true, false, || false));
+        let file = std::env::temp_dir().join(format!("SteamVrMcp-stack-ours-{}.vrsettings", std::process::id()));
+        std::fs::write(&file, r#"{"driver_alvr_server":{"blocked_by_safe_mode":true}}"#).unwrap();
+        assert!(stop_is_ours(false, false, true, || setup::alvr_blocked(&file)));
+        std::fs::write(&file, r#"{"driver_lighthouse":{"blocked_by_safe_mode":true}}"#).unwrap();
+        assert!(!stop_is_ours(false, false, true, || setup::alvr_blocked(&file)));
+        std::fs::remove_file(&file).ok();
     }
 
     #[test]
@@ -3284,22 +3663,117 @@ mod tests {
         assert!(app_exited(None, Some(5), |_| false).unwrap().contains("scene pid 5"));
     }
 
-    #[test]
-    fn wait_for_log_fails_once_the_launched_game_exits() {
+    /// A stack whose app 42 logs to the returned game.log, primed before the file exists, and whose Proton launch already exited.
+    fn exited_game(name: &str) -> (Arc<Stack>, PathBuf, PathBuf) {
         use std::os::unix::process::ExitStatusExt;
-        let (stack, root) = blocked_stack("wait-exit", false);
+        let (stack, root) = blocked_stack(name, false);
         let (steam, cfg) = (stack.paths().steam_dir.unwrap(), Config::parse("[app_logs]\n\"42\" = [\"${install}/game.log\"]").unwrap());
         std::fs::create_dir_all(steam.join("steamapps/common/Game")).unwrap();
         std::fs::write(steam.join("steamapps/appmanifest_42.acf"), "\"AppState\"\n{\n\t\"installdir\"\t\t\"Game\"\n}\n").unwrap();
         *stack.cfg.lock() = cfg.clone();
         *stack.app_logs.lock() = AppLogs::new(&cfg.app_logs);
+        stack.read_app_log(ReadAppLogArgs { app_id: "42".into(), since_seq: None, contains: None, limit: None }).unwrap();
         let exited = Arc::new(Mutex::new(Some(std::process::ExitStatus::from_raw(256))));
         stack.state.lock().launched = Some(proton::Launched { pgid: 0, compatdata: root.clone(), app_id: 42, exited });
-        let a = WaitForLogArgs { app_id: "42".into(), pattern: "READY".into(), fail_pattern: None, since_seq: None, timeout_s: Some(5.0) };
+        (stack, root, steam.join("steamapps/common/Game/game.log"))
+    }
+
+    fn wait_ready(stack: &Stack, timeout_s: f64) -> Result<Value> {
+        stack.wait_for_log(WaitForLogArgs { app_id: "42".into(), pattern: "READY".into(), fail_pattern: None, since_seq: None, timeout_s: Some(timeout_s) })
+    }
+
+    #[test]
+    fn wait_for_log_fails_once_the_launched_game_exits() {
+        let (stack, root, _) = exited_game("wait-exit");
         let started = Instant::now();
-        let e = stack.wait_for_log(a).unwrap_err().to_string();
+        let e = wait_ready(&stack, 5.0).unwrap_err().to_string();
         assert!(e.contains("failed: app exited"), "{e}");
         assert!(started.elapsed() < Duration::from_secs(2));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn wait_for_log_counts_the_unfinished_last_line_of_an_exited_game() {
+        let (stack, root, log) = exited_game("wait-partial");
+        std::fs::write(&log, "boot\nREADY").unwrap();
+        assert_eq!(wait_ready(&stack, 5.0).unwrap()["result"], "match");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn wait_for_log_reads_a_backlog_over_the_read_cap_before_failing() {
+        let (stack, root, log) = exited_game("wait-backlog");
+        let filler = format!("{}\n", "x".repeat(1023));
+        std::fs::write(&log, filler.repeat(5 << 10) + "READY\n").unwrap();
+        assert_eq!(wait_ready(&stack, 5.0).unwrap()["result"], "match");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn wait_for_log_joins_a_last_line_written_in_two_parts() {
+        let (stack, root, log) = exited_game("wait-split");
+        std::fs::write(&log, "boot\n").unwrap();
+        // a byte every 30 ms keeps each pair of 50 ms reads busy, while the line takes 150 ms: past two reads, so a count of finished lines splits it
+        let writer = thread::spawn(move || {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+            for part in ["R", "E", "A", "D", "Y\n"] {
+                thread::sleep(Duration::from_millis(30));
+                f.write_all(part.as_bytes()).unwrap();
+            }
+        });
+        assert_eq!(wait_ready(&stack, 5.0).unwrap()["result"], "match");
+        writer.join().unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn wait_for_log_counts_an_unfinished_line_still_growing_at_the_drain_limit() {
+        let (stack, root, log) = exited_game("wait-growing");
+        let writing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer = {
+            let (writing, log) = (Arc::clone(&writing), log.clone());
+            thread::spawn(move || {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new().append(true).create(true).open(&log).unwrap();
+                f.write_all(b"READY").unwrap();
+                while writing.load(SeqCst) {
+                    f.write_all(b".").unwrap();
+                    thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        let started = Instant::now();
+        let found = wait_ready(&stack, 30.0);
+        writing.store(false, SeqCst);
+        writer.join().unwrap();
+        assert_eq!(found.unwrap()["result"], "match");
+        assert!(started.elapsed() < LOG_DRAIN + Duration::from_secs(2), "{:?}", started.elapsed());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn wait_for_log_drain_is_bounded() {
+        // a writer that never stops: the drain gives up at LOG_DRAIN, however its polls see the file grow
+        let (stack, root, log) = exited_game("wait-drain");
+        let writing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer = {
+            let (writing, log) = (Arc::clone(&writing), log.clone());
+            thread::spawn(move || {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new().append(true).create(true).open(&log).unwrap();
+                while writing.load(SeqCst) {
+                    f.write_all(b"still logging\n").unwrap();
+                    thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        let started = Instant::now();
+        let e = wait_ready(&stack, 30.0).unwrap_err().to_string();
+        assert!(e.contains("failed: app exited"), "{e}");
+        assert!(started.elapsed() < LOG_DRAIN + Duration::from_secs(2), "{:?}", started.elapsed());
+        writing.store(false, SeqCst);
+        writer.join().unwrap();
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -3361,8 +3835,12 @@ mod tests {
         let cfg = Config::parse("[app_logs]\n\"42\" = [\"${install}/game.log\"]").unwrap();
         let stack = Stack::new(cfg, paths);
         assert!(stack.readiness().app_logs);
-        let read = |since| stack.read_app_log(ReadAppLogArgs { app_id: "42".into(), since_seq: since }).unwrap();
+        let read = |since| stack.read_app_log(ReadAppLogArgs { app_id: "42".into(), since_seq: since, contains: None, limit: None }).unwrap();
         assert!(read(None).lines.is_empty());
+        for limit in [0, applog::PAGE + 1] {
+            let e = stack.read_app_log(ReadAppLogArgs { app_id: "42".into(), since_seq: None, contains: None, limit: Some(limit) }).unwrap_err();
+            assert_eq!(e.to_string(), "limit must be 1 to 500");
+        }
         std::fs::write(steam.join("steamapps/common/Game/game.log"), "boot\nERROR x\nREADY\n").unwrap();
         let wait = |pattern: &str, fail: Option<&str>, since| {
             let a = WaitForLogArgs { app_id: "42".into(), pattern: pattern.into(), fail_pattern: fail.map(String::from), since_seq: since, timeout_s: Some(1.0) };

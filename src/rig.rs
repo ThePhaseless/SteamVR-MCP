@@ -597,7 +597,7 @@ pub struct Rig {
     playspace: Vec2,
     /// Set until the tracking thread sends it.
     playspace_pending: bool,
-    /// What the headset reports as worn at every stream start; here because the rig outlives headsets.
+    /// What the headset reports as worn at every stream start; here because the rig outlives headset restarts (not a new vr_start session).
     pub on_head: bool,
     /// Orders proximity sends so the latest wins, without holding the rig lock across a blocking socket write.
     pub proximity_send: Arc<Mutex<()>>,
@@ -623,6 +623,13 @@ impl Rig {
             on_head: true,
             proximity_send: Arc::default(),
         }
+    }
+
+    /// A new rig's state, for a vr_start that begins a session. The same proximity_send, so a send racing the reset still orders.
+    /// The default area goes out anyway: the tracking thread recenters at every stream start.
+    // shortcut: an adopted SteamVR's driver keeps the last binary input value and ALVR's fresh mapping drops a lone release, so a button held by an earlier stream stays pressed until vr_stop; upgrade if that shows up in tests
+    pub fn reset(&mut self) {
+        *self = Rig { proximity_send: Arc::clone(&self.proximity_send), ..Rig::new() };
     }
 
     /// Sets the play area in meters; the tracking thread sends it. ALVR draws ±area (ChaperoneUpdater.cpp:69-76), so it gets half.
@@ -1114,6 +1121,33 @@ mod tests {
         let a: RigAction = serde_json::from_str(r#"{"action":"set_grip","args":{"hand":"left","value":0.5}}"#).unwrap();
         assert!(matches!(a, RigAction::SetGrip(GripArgs { force: None, .. })));
     }
+    #[test]
+    fn reset_restores_defaults_and_keeps_the_send_order() {
+        let (mut rig, now) = (Rig::new(), Instant::now());
+        let send_order = Arc::clone(&rig.proximity_send);
+        rig.apply(RigAction::SetHeadPose(pose_at([1.0, 1.0, 1.0])), now).unwrap();
+        rig.apply(RigAction::AnimateHead(AnimateArgs { waypoints: vec![pose_at([0.0, 2.0, 0.0])], duration_s: 5.0 }), now).unwrap();
+        let args = ControllerPoseArgs { hand: Hand::Right, pose: pose_at([0.5, 1.0, 0.0]), relative_to: RelativeTo::Playspace };
+        rig.apply(RigAction::SetControllerPose(args), now).unwrap();
+        rig.apply(press(Hand::Right, Button::A), now).unwrap();
+        rig.apply(RigAction::SetFingerCurl(FingerCurlArgs { index: Some(1.0), ..finger_curl(Hand::Right) }), now).unwrap();
+        let joints = (0..26).map(|i| [0.0, 1.0, -(i as f32) * 0.01, 0.0, 0.0, 0.0, 1.0]).collect();
+        rig.apply(RigAction::SetHandSkeleton(HandSkeletonArgs { hand: Hand::Right, joints }), now).unwrap();
+        rig.apply(RigAction::SetHandMode(HandModeArgs { hand: Hand::Left, mode: HandMode::Hand }), now).unwrap();
+        rig.apply(RigAction::SetControllerState(ControllerStateArgs { hand: Hand::Left, connected: None, tracked: Some(false) }), now).unwrap();
+        rig.set_playspace(4.0, 4.0).unwrap();
+        rig.on_head = false;
+        rig.reset();
+        let json = |rig: &mut Rig| serde_json::to_value(rig.tracking(now + Duration::from_secs(1), Duration::ZERO)).unwrap();
+        assert_eq!(json(&mut rig), json(&mut Rig::new()));
+        assert!(rig.take_buttons().is_empty() && rig.all_buttons().is_empty());
+        assert_eq!(rig.take_playspace(), None);
+        rig.recenter();
+        assert_eq!(rig.take_playspace(), Some(Vec2::ONE), "the default 2 x 2 area");
+        assert!(rig.on_head);
+        assert!(Arc::ptr_eq(&rig.proximity_send, &send_order), "a send racing the reset still orders against later ones");
+    }
+
     #[test]
     fn playspace_sends_half_extents() {
         let mut rig = Rig::new();

@@ -97,7 +97,7 @@ struct FrameTimingArgs {
 #[derive(Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct HapticsArgs {
-    /// Only events with t_s after this; pass the last t_s seen to get new ones.
+    /// Only events with t_s after this; pass the last t_s seen to get new ones. Omit it after the system clock was stepped back.
     since_s: Option<f64>,
     /// Empty the log after reading.
     #[serde(default)]
@@ -173,7 +173,7 @@ impl VrServer {
         tokio::task::spawn_blocking(move || f(&stack)).await?
     }
 
-    #[tool(description = "Startup checks (ok, reason, fix) as of MCP start or the last vr_start, re-run (and config.toml re-read) here when config.toml changed or a core check fails, with the ALVR dashboard check always re-run, and the current state of Steam, SteamVR, ALVR, the virtual headset (streaming, fps, resolution, codec), on_head (the proximity it reports at every stream start) and, while the OpenVR reader is connected, the scene app. Top-level dashboard_visible says whether SteamVR's dashboard is open (null when unknown: the OpenVR reader is not connected or lacks the interface). The state also carries blocked_drivers (driver_* sections SteamVR blocked in safe mode; vr_start, vr_stop and a SteamVR restart clear them), owner (who holds the SteamVR lease, and whether this MCP does; null when free) and the session clock: now_t_s (seconds since MCP start), now_at and t0_at (RFC 3339 UTC, the instants of now and of t_s 0).")]
+    #[tool(description = "Startup checks (ok, reason, fix) as of MCP start or the last vr_start, re-run (and config.toml re-read) here when config.toml changed or a core check fails, with the ALVR dashboard check always re-run, and the current state of Steam, SteamVR, ALVR, the virtual headset (streaming, fps, resolution, codec), on_head (the proximity it reports at every stream start) and, while the OpenVR reader is connected, the scene app. Top-level dashboard_visible says whether SteamVR's dashboard is open (null when unknown: the OpenVR reader is not connected or lacks the interface). The state also carries blocked_drivers (driver_* sections SteamVR blocked in safe mode; vr_start, vr_stop and a SteamVR restart clear them), owner (who holds the SteamVR lease, and whether this MCP does; null when free) and the session clock: now_t_s (wall-clock seconds since MCP start), now_at and t0_at (RFC 3339 UTC, the instants of now and of t_s 0). t_s follows the system clock, so it jumps, or goes back, when the clock is stepped.")]
     async fn vr_status(&self) -> Result<CallToolResult, String> {
         self.run(|s| {
             let dashboard_visible = s.reader_connected().then(|| s.dashboard_visible()).flatten();
@@ -183,7 +183,7 @@ impl VrServer {
         .map_err(message)
     }
 
-    #[tool(description = "Take or renew the lease on this machine's SteamVR under a name of your choice. Every tool that changes anything takes it by itself, so call this only to pick the name or the ttl, or to take over a lease that expired after its MCP stopped managing a session. Refuses while another live MCP holds it. Returns the lease.")]
+    #[tool(description = "Take or renew the lease on this machine's SteamVR under a name of your choice. Every tool that changes anything takes it by itself, so call this only to pick the name or the ttl, or to take over a lease that expired after its MCP stopped managing a session. Refuses while another live MCP holds it. The name and ttl hold until the lease is released. Returns the lease.")]
     async fn vr_acquire(&self, Parameters(args): Parameters<AcquireArgs>) -> Result<CallToolResult, String> {
         self.run(move |s| json(Owner { lease: s.acquire_lease(args.owner, args.ttl_s)?, mine: true })).await.map_err(message)
     }
@@ -193,17 +193,17 @@ impl VrServer {
         self.run(|s| json(serde_json::json!({ "released": s.release()? }))).await.map_err(message)
     }
 
-    #[tool(description = "Start Steam if needed, SteamVR with ALVR and the virtual headset, and return once it streams, or with the reason it stopped. Can take minutes (up to timeouts.streaming_s, default 240 s). The result's dashboard_visible says whether SteamVR's dashboard is open at that moment (null when unknown); SteamVR opens it about 10 s after no scene app runs, so call close_dashboard once your game reaches its scene.")]
+    #[tool(description = "Start Steam if needed, SteamVR with ALVR and the virtual headset, and return once it streams, or with the reason it stopped. Can take minutes (up to timeouts.streaming_s, default 240 s). The result's dashboard_visible says whether SteamVR's dashboard is open at that moment (null when unknown); SteamVR opens it about 10 s after no scene app runs, so call close_dashboard once your game reaches its scene. A vr_start that gets past its preflight checks resets the rig to its defaults (head and controller poses, buttons, hand state, playspace, proximity, animations), so set poses after it. It resets also when the start then fails, for example when it cannot adopt a running SteamVR, and during a stream gap, where it builds a new session. A start refused by a preflight check (no ALVR streamer found, or a running Steam without steam.env) keeps the rig, and so does a vr_start while the headset streams, as SteamVR restarts and reconnects do. Fails at once if SteamVR's safe mode blocks ALVR's driver.")]
     async fn vr_start(&self) -> Result<CallToolResult, String> {
         self.run(|s| json(s.start()?)).await.map_err(message)
     }
 
-    #[tool(description = "Shut SteamVR down through ALVR (with signals if ALVR hangs) and disconnect the headset. Closes Steam only if vr_start started it. Ends a game that launch_app via proton started first (stopped_app lists its pids). Refuses a SteamVR that runs without ALVR. Can take minutes.")]
+    #[tool(description = "Shut SteamVR down through ALVR (with signals if ALVR hangs) and disconnect the headset. If vr_start started Steam, asks it to exit. When the MCP identified the Steam client it started, and that client still runs after 60 s, it sends that one process SIGTERM; while that client still runs afterwards, the next vr_stop tries again. Without that record it forwards one -shutdown at this vr_stop, sends no signal and keeps nothing for a later one. Once the recorded client is gone (Steam may restart it itself), the Steam running now is left alone. No other Steam process is ever signalled. A Steam you started is never asked to exit when the MCP recorded the client it started; without that record, vr_stop asks whatever Steam runs then to exit, once. -shutdown is forwarded only if a process named steam still runs. When vr_start started Steam or a client record was kept, closed_steam is true when no Steam process is left (also when Steam had already exited) and remaining_steam lists the names of the Steam processes still alive at the end; otherwise Steam is not touched and they stay false and empty. signalled_steam says whether the SIGTERM went out; steam_note says why Steam may still run (the -shutdown failed, the recorded client was gone, or no later vr_stop will close it). Ends a game that launch_app via proton started first (stopped_app lists its pids). Refuses a SteamVR that runs without ALVR. Can take minutes.")]
     async fn vr_stop(&self) -> Result<CallToolResult, String> {
         self.run(|s| json(s.stop()?)).await.map_err(message)
     }
 
-    #[tool(description = "A PNG screenshot: both eyes side by side, or one eye. source headset (default): what the headset streams, from a fresh keyframe. source compositor: SteamVR's uncompressed scene textures; needs a scene app that has submitted a frame. Only VR frames: there is no desktop or window source.")]
+    #[tool(description = "A PNG screenshot: both eyes side by side, or one eye. source headset (default): what the headset streams, about 18 frames after a fresh keyframe, so the image is sharper and a pose just set has usually reached the game; this is slower than taking the keyframe alone, and a slow game can still show the old aim. If the stream stalls, or a frame fails to decode (a lost frame usually does), it returns an earlier frame, at worst the keyframe; corrupt data that still decodes is not detected. source compositor: SteamVR's uncompressed scene textures; needs a scene app that has submitted a frame. Only VR frames: there is no desktop or window source.")]
     async fn screenshot(&self, Parameters(args): Parameters<ScreenshotArgs>) -> Result<CallToolResult, String> {
         self.run(move |s| {
             checks::source_ready(args.source.name(), &s.readiness()).map_err(|e| anyhow::anyhow!("not ready: {e}"))?;
@@ -361,7 +361,7 @@ impl VrServer {
         json(self.stack.run_sequence(args.steps).await.map_err(message)?).map_err(message)
     }
 
-    #[tool(description = "Haptic events the app sent, oldest first: t_s (seconds since MCP start), at (the same instant as RFC 3339 UTC), hand (left, right or other), duration_s, frequency (Hz) and amplitude (0 to 1). Keeps the newest 1024.")]
+    #[tool(description = "Haptic events the app sent, oldest first: t_s (wall-clock seconds since MCP start; it jumps or goes back if the system clock is stepped, and after a backward step omit since_s), at (the same instant as RFC 3339 UTC), hand (left, right or other), duration_s, frequency (Hz) and amplitude (0 to 1). Keeps the newest 1024.")]
     async fn get_haptics(&self, Parameters(args): Parameters<HapticsArgs>) -> Result<CallToolResult, String> {
         self.run(move |s| json(s.haptics(args.since_s.unwrap_or(f64::NEG_INFINITY), args.clear))).await.map_err(message)
     }
@@ -392,17 +392,17 @@ impl VrServer {
         self.run(move |s| json(s.set_hand_tracking_flavour(skeletal)?)).await.map_err(message)
     }
 
-    #[tool(description = "ALVR log events (the newest 1000 since MCP start) and the tails of SteamVR's vrserver, vrcompositor and vrmonitor logs, merged in time order: t_s, at (session clock: seconds since MCP start, and RFC 3339 UTC), t (local time of day), source, level, text. Filter by source (alvr, vrserver, vrcompositor, vrmonitor or all), text (contains, ignoring case) and min_level (error, warning, info, debug; applies to ALVR events only, SteamVR lines are filtered by text only). Returns the newest limit lines (1 to 1000, default 100).")]
+    #[tool(description = "ALVR log events (the newest 1000 since MCP start) and the tails of SteamVR's vrserver, vrcompositor and vrmonitor logs, merged in time order: t_s, at (session clock: wall-clock seconds since MCP start, and RFC 3339 UTC; after the system clock is stepped back, newer lines can sort before older ones and fall outside limit), t (local time of day), source, level, text. Filter by source (alvr, vrserver, vrcompositor, vrmonitor or all), text (contains, ignoring case) and min_level (error, warning, info, debug; applies to ALVR events only, SteamVR lines are filtered by text only). Returns the newest limit lines (1 to 1000, default 100).")]
     async fn get_logs(&self, Parameters(args): Parameters<LogQuery>) -> Result<CallToolResult, String> {
         self.run(move |s| json(s.logs(args)?)).await.map_err(message)
     }
 
-    #[tool(description = "Lines of a game's own log files, tailed as config.toml's [app_logs] table says for this app id: {app_id, files (matched now), lines (seq, t_s, at, file, text; seq >= since_seq, oldest first, at most 500), next_seq}. t_s and at give the moment the MCP read the line. Each app keeps its newest 5000 lines; launch_app clears them. Pass the last next_seq as since_seq to read on.")]
+    #[tool(description = "Lines of a game's own log files, tailed as config.toml's [app_logs] table says for this app id: {app_id, files (matched now), lines (seq, t_s, at, file, text; seq >= since_seq, oldest first), next_seq}. Filter by contains (ignoring case); returns the oldest limit matching lines (1 to 500, default 500). t_s and at give the moment the MCP read the line. Each app keeps its newest 5000 lines; launch_app clears them. Pass the last next_seq as since_seq to read on.")]
     async fn read_app_log(&self, Parameters(args): Parameters<ReadAppLogArgs>) -> Result<CallToolResult, String> {
         self.run(move |s| json(s.read_app_log(args)?)).await.map_err(message)
     }
 
-    #[tool(description = "Wait until a line of the app's [app_logs] files matches pattern (a regex) or fail_pattern, whichever line comes first, fail_pattern checked first on each line. Returns {result: \"match\" | \"fail\" | \"timeout\", line, next_seq}; fails with \"failed: app exited\" once the Proton launcher or the scene app running at the call's start is gone. Starts at since_seq (default: the oldest line kept, the first since launch_app), so lines logged before the call count. Bad arguments fail at once. Can take minutes (timeout_s, up to 600).")]
+    #[tool(description = "Wait until a line of the app's [app_logs] files matches pattern (a regex) or fail_pattern, whichever line comes first, fail_pattern checked first on each line. Returns {result: \"match\" | \"fail\" | \"timeout\", line, next_seq}; fails with \"failed: app exited\" once the Proton launcher or the scene app running at the call's start is gone, after reading its files to their end, an unfinished last line included; that read lasts until the files stop growing, at most 2 s, which can run past timeout_s. Starts at since_seq (default: the oldest line kept, the first since launch_app), so lines logged before the call count. Bad arguments fail at once. Can take minutes (timeout_s, up to 600).")]
     async fn wait_for_log(&self, Parameters(args): Parameters<WaitForLogArgs>) -> Result<CallToolResult, String> {
         self.run(move |s| json(s.wait_for_log(args)?)).await.map_err(message)
     }

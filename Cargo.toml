@@ -44,3 +44,10 @@ ash = { version = "=0.38.0", default-features = false, features = ["loaded"] }
 
 [build-dependencies]
 bindgen = "0.73"
+
+# the live tests decode about 19 H.264 frames per headset screenshot; an unoptimized decoder takes seconds per shot
+[profile.dev.package.openh264-sys2]
+opt-level = 3
+
+[profile.dev.package.openh264]
+opt-level = 3

@@ -2,8 +2,10 @@ use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
 use alvr_common::{
     Fov, HAND_LEFT_ID, HAND_RIGHT_ID, Pose, RelaxedAtomic, ViewParams,
     anyhow::{Context, Result, bail},
+    debug,
     glam::{Quat, UVec2, Vec3},
     parking_lot::Mutex,
+    warn,
 };
 use crate::{alvr_api::Api, clock, rig::Rig};
 use openh264::{decoder::Decoder, formats::YUVSource};
@@ -72,7 +74,7 @@ pub struct Screenshot {
     pub source: &'static str,
     /// The stream's timestamp of the frame; only for the headset.
     pub frame_timestamp_ms: Option<u64>,
-    /// When the IDR frame arrived (headset) or the compositor was asked (compositor), on the session clock.
+    /// When the returned frame arrived (headset) or the compositor was asked (compositor), on the session clock.
     pub t_s: f64,
     pub at: String,
 }
@@ -94,13 +96,28 @@ pub struct HapticEvent {
     pub amplitude: f32,
 }
 
+/// Frames a screenshot decodes after the fresh IDR: 250 ms at 72 fps, time for a pose just set to reach the game and for P-frames to sharpen the image.
+const FRAMES_AFTER_IDR: usize = 18;
+/// How long a screenshot waits for the IDR it asked for.
+const IDR_WAIT: Duration = Duration::from_secs(2);
+/// How long it waits for the frames after the IDR.
+const FRAMES_WAIT: Duration = Duration::from_secs(1);
+
+/// A video frame as it arrived; `t_s` on the session clock.
+struct Frame {
+    timestamp: Duration,
+    nal: Vec<u8>,
+    t_s: f64,
+}
+
 #[derive(Default)]
 struct Shared {
     status: HeadsetStatus,
     config_nal: Vec<u8>,
-    /// Set by a screenshot in progress: the first IDR frame to arrive lands in `idr`.
+    /// Set by a screenshot in progress: an IDR frame and the frames after it land in `frames`.
     armed: bool,
-    idr: Option<(Duration, Vec<u8>, Instant)>,
+    /// At most FRAMES_AFTER_IDR + 1, starting at an IDR.
+    frames: Vec<Frame>,
     /// Timestamp of the newest video frame, for ALVR's client statistics.
     last_frame: Duration,
     /// The newest HAPTICS_KEPT haptic events, oldest first.
@@ -115,8 +132,15 @@ impl Shared {
     fn on_frame(&mut self, timestamp: Duration, nal: &[u8]) -> bool {
         self.status.frames_received += 1;
         self.last_frame = timestamp;
-        if self.armed && self.idr.is_none() && has_idr(nal) {
-            self.idr = Some((timestamp, nal.to_vec(), Instant::now()));
+        // a copy only: decoding waits for the screenshot's own thread
+        if self.armed && self.frames.len() <= FRAMES_AFTER_IDR {
+            let idr = has_idr(nal);
+            if idr {
+                self.frames.clear(); // a later IDR (the client's RequestIdr after a loss, or ALVR's) starts the chain again
+            }
+            if idr || !self.frames.is_empty() {
+                self.frames.push(Frame { timestamp, nal: nal.to_vec(), t_s: clock::now_s() });
+            }
         }
         self.status.codec.is_some()
     }
@@ -194,14 +218,47 @@ pub fn has_idr(annexb: &[u8]) -> bool {
 }
 
 /// Decodes one IDR frame, after the codec's config NALs, into `(width, height, RGB8)`.
-// shortcut: decodes one IDR per call; keep a running decoder if callers need many frames per second
 pub fn decode_idr(config_nal: &[u8], frame: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
+    decode_chain(config_nal, &[frame]).map(|(_, w, h, rgb)| (w, h, rgb))
+}
+
+/// Decodes `frames`, an IDR and the frames after it, into the index of the last one decoded and its `(width, height, RGB8)`.
+/// The IDR must decode. A later frame that fails ends the chain at the last good picture: past a lost or broken frame
+/// the picture would be corrupt (OpenH264 runs without error concealment, so a frame_num gap is an error).
+// shortcut: converts every decoded frame to RGB; convert only the last and re-decode on the rare error if the rig shows this slow
+fn decode_chain(config_nal: &[u8], frames: &[&[u8]]) -> Result<(usize, u32, u32, Vec<u8>)> {
+    let Some((first, rest)) = frames.split_first() else { bail!("no frame to decode") };
     let mut decoder = Decoder::new()?;
-    let yuv = decoder.decode(&[config_nal, frame].concat())?.context("the decoder produced no picture")?;
-    let (w, h) = yuv.dimensions();
-    let mut rgb = vec![0; w * h * 3];
-    yuv.write_rgb8(&mut rgb);
-    Ok((w as u32, h as u32, rgb))
+    let mut rgb = vec![];
+    let to_rgb = |yuv: openh264::decoder::DecodedYUV<'_>, rgb: &mut Vec<u8>| {
+        let (w, h) = yuv.dimensions();
+        rgb.resize(w * h * 3, 0);
+        yuv.write_rgb8(rgb);
+        (w as u32, h as u32)
+    };
+    let yuv = decoder.decode(&[config_nal, first].concat())?.context("the decoder produced no picture")?;
+    let (mut index, (mut w, mut h)) = (0, to_rgb(yuv, &mut rgb));
+    for (i, frame) in rest.iter().enumerate() {
+        match decoder.decode(frame) {
+            Ok(Some(yuv)) => (index, (w, h)) = (i + 1, to_rgb(yuv, &mut rgb)),
+            Ok(None) => (),
+            Err(e) => {
+                warn!("screenshot: frame {} of {} after the IDR failed to decode ({e}); returning frame {index}", i + 1, rest.len());
+                break;
+            }
+        }
+    }
+    Ok((index, w, h, rgb))
+}
+
+/// `eye` of the last frame of `frames` that decodes, stamped with that frame's timestamp and arrival.
+fn screenshot_of(config_nal: &[u8], frames: &[Frame], eye: Eye) -> Result<Screenshot> {
+    let (index, width, height, rgb) = decode_chain(config_nal, &frames.iter().map(|f| f.nal.as_slice()).collect::<Vec<_>>())?;
+    let (width, rgb) = crop(eye, width, height, &rgb);
+    let png = encode_rgb(width, height, &rgb)?;
+    let frame = &frames[index];
+    let (source, frame_timestamp_ms) = (Source::Headset.name(), Some(frame.timestamp.as_millis() as u64));
+    Ok(Screenshot { png, width, height, source, frame_timestamp_ms, t_s: frame.t_s, at: clock::at(frame.t_s) })
 }
 
 /// The part of a side-by-side RGB8 frame `eye` shows: ALVR packs the left eye on the left half.
@@ -393,8 +450,9 @@ impl Headset {
 pub struct Grabber(Arc<Mutex<Shared>>);
 
 impl Grabber {
-    /// Asks ALVR for an IDR frame, waits up to 2 s for it, and returns `eye` of it as a PNG.
-    // shortcut: one screenshot at a time (a second call's disarm cuts the first short), enough for one MCP client
+    /// Asks ALVR for an IDR frame, waits up to IDR_WAIT for it and FRAMES_WAIT for the FRAMES_AFTER_IDR frames after it,
+    /// and returns `eye` of the last frame that decodes as a PNG: sharper than the IDR alone, and a pose just set has usually reached the game.
+    // shortcut: one screenshot at a time (a second call's arming cuts the first short, now likelier over the longer wait), enough for one MCP client
     pub fn screenshot(&self, api: &Api, eye: Eye) -> Result<Screenshot> {
         let codec = self.0.lock().status.codec.clone().context("the headset has not received ALVR's decoder config yet")?;
         if codec != "H264" {
@@ -402,27 +460,40 @@ impl Grabber {
         }
         {
             let mut shared = self.0.lock();
-            (shared.armed, shared.idr) = (true, None);
+            shared.armed = true;
+            shared.frames.clear();
         }
-        let posted = api.post("/api/insert-idr");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let frame = loop {
+        if let Err(e) = api.post("/api/insert-idr") {
+            self.0.lock().armed = false;
+            return Err(e);
+        }
+        let (frames, config_nal) = self.wait_frames(IDR_WAIT, FRAMES_WAIT);
+        if frames.is_empty() {
+            bail!("no IDR frame arrived (deadline {} s)", IDR_WAIT.as_secs());
+        }
+        if frames.len() <= FRAMES_AFTER_IDR {
+            debug!("screenshot: only {} of {} frames after the IDR arrived; returning the last that decodes", frames.len() - 1, FRAMES_AFTER_IDR);
+        }
+        screenshot_of(&config_nal, &frames, eye)
+    }
+
+    /// Polls every 10 ms, without holding the lock between polls, until FRAMES_AFTER_IDR frames followed the IDR, `tail` passed
+    /// since the IDR (`idr_wait` before it), or the stream stopped after the IDR. Disarms, and returns the frames and the config NALs.
+    fn wait_frames(&self, idr_wait: Duration, tail: Duration) -> (Vec<Frame>, Vec<u8>) {
+        let (mut deadline, mut seen) = (Instant::now() + idr_wait, false);
+        loop {
             let mut shared = self.0.lock();
-            if posted.is_err() || shared.idr.is_some() || Instant::now() >= deadline {
+            if !seen && !shared.frames.is_empty() {
+                (deadline, seen) = (Instant::now() + tail, true); // a later IDR does not extend it
+            }
+            let stopped = seen && !shared.status.streaming;
+            if shared.frames.len() > FRAMES_AFTER_IDR || stopped || Instant::now() >= deadline {
                 shared.armed = false;
-                break shared.idr.take().map(|idr| (idr, shared.config_nal.clone()));
+                return (std::mem::take(&mut shared.frames), shared.config_nal.clone());
             }
             drop(shared);
             thread::sleep(Duration::from_millis(10));
-        };
-        posted?;
-        let ((timestamp, frame, arrived), config_nal) = frame.context("no IDR frame arrived (deadline 2 s)")?;
-        let (width, height, rgb) = decode_idr(&config_nal, &frame)?;
-        let (width, rgb) = crop(eye, width, height, &rgb);
-        let png = encode_rgb(width, height, &rgb)?;
-        let t_s = clock::t_s(arrived);
-        let (source, frame_timestamp_ms) = (Source::Headset.name(), Some(timestamp.as_millis() as u64));
-        Ok(Screenshot { png, width, height, source, frame_timestamp_ms, t_s, at: clock::at(t_s) })
+        }
     }
 }
 
@@ -565,16 +636,145 @@ mod tests {
         assert_eq!(hand_name(*alvr_common::HEAD_ID), "other");
     }
 
+    const P_FRAME: &[u8] = &[0, 0, 0, 1, 0x41, 0x9a];
+
     #[test]
-    fn armed_slot_keeps_the_first_idr_only() {
+    fn armed_slot_collects_the_idr_and_the_next_frames() {
         let mut s = Shared::default();
+        let timestamps = |s: &Shared| s.frames.iter().map(|f| f.timestamp.as_millis()).collect::<Vec<_>>();
         s.on_frame(Duration::from_millis(1), FIXTURE);
-        assert_eq!(s.idr, None, "not armed");
+        assert!(s.frames.is_empty(), "not armed");
         s.armed = true;
-        s.on_frame(Duration::from_millis(2), &[0, 0, 0, 1, 0x41, 0x9a]);
-        assert_eq!(s.idr, None, "not an IDR");
+        s.on_frame(Duration::from_millis(2), P_FRAME);
+        assert!(s.frames.is_empty(), "nothing before the IDR");
         s.on_frame(Duration::from_millis(3), FIXTURE);
-        s.on_frame(Duration::from_millis(4), FIXTURE);
-        assert_eq!(s.idr.map(|(t, nal, _)| (t, nal)), Some((Duration::from_millis(3), FIXTURE.to_vec())));
+        s.on_frame(Duration::from_millis(4), P_FRAME);
+        assert_eq!(timestamps(&s), [3, 4]);
+        s.on_frame(Duration::from_millis(5), FIXTURE);
+        assert_eq!(timestamps(&s), [5], "a later IDR restarts the chain");
+        for t in 6..40 {
+            s.on_frame(Duration::from_millis(t), P_FRAME);
+        }
+        assert_eq!(s.frames.len(), FRAMES_AFTER_IDR + 1);
+        assert_eq!(s.frames.last().unwrap().timestamp, Duration::from_millis(5 + FRAMES_AFTER_IDR as u64));
+    }
+
+    /// A grabber whose shared state streams and is armed, and a feeder that runs `feed` on it.
+    fn armed_grabber(feed: impl FnOnce(&Mutex<Shared>) + Send + 'static) -> (Grabber, JoinHandle<()>) {
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        {
+            let mut s = shared.lock();
+            s.on_streaming_started(72.0, [1088, 1216]);
+            (s.armed, s.config_nal) = (true, vec![7]);
+        }
+        let feeder = Arc::clone(&shared);
+        (Grabber(shared), thread::spawn(move || feed(&feeder)))
+    }
+
+    fn feed_frames(shared: &Mutex<Shared>, n: u64) {
+        for t in 0..n {
+            thread::sleep(Duration::from_millis(5));
+            shared.lock().on_frame(Duration::from_millis(t), if t == 0 { FIXTURE } else { P_FRAME });
+        }
+    }
+
+    #[test]
+    fn wait_frames_returns_at_the_cap() {
+        let (grabber, feeder) = armed_grabber(|s| feed_frames(s, 40));
+        let began = Instant::now();
+        let (frames, config_nal) = grabber.wait_frames(Duration::from_secs(2), Duration::from_secs(5));
+        assert_eq!((frames.len(), config_nal), (FRAMES_AFTER_IDR + 1, vec![7]));
+        assert!(began.elapsed() < Duration::from_secs(2), "{:?}", began.elapsed());
+        assert!(!grabber.0.lock().armed);
+        feeder.join().unwrap();
+    }
+
+    #[test]
+    fn wait_frames_returns_the_best_frames_at_the_tail() {
+        let (grabber, feeder) = armed_grabber(|s| feed_frames(s, 4));
+        let began = Instant::now();
+        let (frames, _) = grabber.wait_frames(Duration::from_secs(2), Duration::from_millis(300));
+        assert_eq!(frames.len(), 4);
+        assert!(began.elapsed() >= Duration::from_millis(300) && began.elapsed() < Duration::from_secs(1), "{:?}", began.elapsed());
+        feeder.join().unwrap();
+    }
+
+    #[test]
+    fn wait_frames_returns_at_once_when_the_stream_stops() {
+        let (grabber, feeder) = armed_grabber(|s| {
+            feed_frames(s, 2);
+            s.lock().on_streaming_stopped();
+        });
+        let began = Instant::now();
+        let (frames, _) = grabber.wait_frames(Duration::from_secs(2), Duration::from_secs(5));
+        assert_eq!(frames.len(), 2);
+        assert!(began.elapsed() < Duration::from_secs(1), "{:?}", began.elapsed());
+        feeder.join().unwrap();
+    }
+
+    #[test]
+    fn wait_frames_without_an_idr_returns_nothing_disarmed() {
+        let (grabber, feeder) = armed_grabber(|s| {
+            s.lock().on_frame(Duration::ZERO, P_FRAME);
+        });
+        let (frames, _) = grabber.wait_frames(Duration::from_millis(200), Duration::from_secs(5));
+        assert!(frames.is_empty() && !grabber.0.lock().armed);
+        feeder.join().unwrap();
+    }
+
+    /// `n` 64x64 frames from OpenH264's own encoder: the first dark and an IDR, the rest bright P-frames.
+    fn encoded(n: usize) -> Vec<Vec<u8>> {
+        use openh264::{OpenH264API, encoder::{BitRate, Encoder, EncoderConfig, FrameType}, formats::YUVBuffer};
+        let config = EncoderConfig::new().skip_frames(false).scene_change_detect(false).bitrate(BitRate::from_bps(8_000_000));
+        let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), config).unwrap();
+        (0..n)
+            .map(|i| {
+                let mut yuv = vec![128; 64 * 64 * 3 / 2];
+                yuv[..64 * 64].fill(if i == 0 { 20 } else { 200 });
+                let bits = encoder.encode(&YUVBuffer::from_vec(yuv, 64, 64)).unwrap();
+                assert_eq!(bits.frame_type() == FrameType::IDR, i == 0, "frame {i}");
+                let nal = bits.to_vec();
+                assert!(!nal.is_empty(), "frame {i}");
+                nal
+            })
+            .collect()
+    }
+
+    fn mean(rgb: &[u8]) -> f64 {
+        rgb.iter().map(|&v| v as f64).sum::<f64>() / rgb.len() as f64
+    }
+
+    #[test]
+    fn decode_chain_returns_the_last_frame() {
+        let stream = encoded(4);
+        let (index, w, h, rgb) = decode_chain(&[], &stream.iter().map(Vec::as_slice).collect::<Vec<_>>()).unwrap();
+        assert_eq!((index, w, h), (3, 64, 64));
+        assert!(mean(&rgb) > 150.0, "{}", mean(&rgb));
+        let (_, _, first) = decode_idr(&[], &stream[0]).unwrap();
+        assert!(mean(&first) < 60.0, "{}", mean(&first));
+    }
+
+    #[test]
+    fn a_frame_that_fails_to_decode_ends_the_chain() {
+        let stream = encoded(3);
+        let garbage: &[u8] = &[0xff; 64]; // no Annex-B start code
+        assert_eq!(decode_chain(&[], &[&stream[0], &stream[1], garbage, &stream[2]]).unwrap().0, 1);
+    }
+
+    #[test]
+    fn a_lost_frame_ends_the_chain() {
+        let stream = encoded(3);
+        assert_eq!(decode_chain(&[], &[stream[0].as_slice(), &stream[2]]).unwrap().0, 0, "OpenH264 reports the frame_num gap");
+    }
+
+    #[test]
+    fn screenshot_stamps_describe_the_returned_frame() {
+        let frames = [
+            Frame { timestamp: Duration::from_millis(5), nal: FIXTURE.to_vec(), t_s: 1.0 },
+            Frame { timestamp: Duration::from_millis(6), nal: vec![0xff; 64], t_s: 2.0 },
+        ];
+        let shot = screenshot_of(&[], &frames, Eye::Both).unwrap();
+        assert_eq!((shot.frame_timestamp_ms, shot.t_s, shot.at), (Some(5), 1.0, clock::at(1.0)));
+        assert_eq!((shot.width, shot.height), (128, 64));
     }
 }
