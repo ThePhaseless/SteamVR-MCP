@@ -28,7 +28,7 @@ libc = "0.2"
 tungstenite = "0.30"
 rmcp = { version = "3.6", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
-libloading = "0.8"
+libloading = "0.9"
 openh264 = "0.9"
 png = "0.18"
 base64 = "0.23"
@@ -43,4 +43,4 @@ openxr = "=0.22.0"
 ash = { version = "=0.38.0", default-features = false, features = ["loaded"] }
 
 [build-dependencies]
-bindgen = "0.72"
+bindgen = "0.73"
