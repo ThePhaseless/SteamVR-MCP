@@ -1,4 +1,4 @@
-# SteamVrMcp
+# SteamVR-MCP
 
 An MCP server that gives an AI agent a virtual SteamVR headset, so it can test VR apps on Linux with nobody wearing one.
 
@@ -25,7 +25,7 @@ You need Rust 1.98 or newer, clang (for bindgen), pkg-config, and the ALSA and P
 cargo build --release
 ```
 
-The binary is `target/release/SteamVrMcp`. `cargo test` runs the unit and integration tests and needs no Steam.
+The binary is `target/release/SteamVR-MCP`. `cargo test` runs the unit and integration tests and needs no Steam.
 
 If the build cannot find `alsa.pc` or `libpipewire-0.3.pc`, point `PKG_CONFIG_PATH` at the directory holding them. If bindgen cannot find `stddef.h`, pass your compiler's include directory through `BINDGEN_EXTRA_CLANG_ARGS`, for example `-I/usr/lib/gcc/x86_64-linux-gnu/14/include`.
 
@@ -36,7 +36,7 @@ The server speaks MCP over stdio and takes no arguments. Registering it starts n
 Claude Code:
 
 ```sh
-claude mcp add --scope user SteamVrMcp -- /path/to/SteamVrMcp/target/release/SteamVrMcp
+claude mcp add --scope user SteamVR-MCP -- /path/to/SteamVR-MCP/target/release/SteamVR-MCP
 ```
 
 Other hosts take the same command in their usual `mcpServers` entry:
@@ -44,7 +44,7 @@ Other hosts take the same command in their usual `mcpServers` entry:
 ```json
 {
   "mcpServers": {
-    "SteamVrMcp": { "command": "/path/to/SteamVrMcp/target/release/SteamVrMcp" }
+    "SteamVR-MCP": { "command": "/path/to/SteamVR-MCP/target/release/SteamVR-MCP" }
   }
 }
 ```
@@ -61,7 +61,7 @@ Whether listed or not, a tool whose prerequisites fail answers `not ready: <reas
 
 ## Configuration
 
-Paths are detected, so most machines need no config. An optional `$XDG_CONFIG_HOME/SteamVrMcp/config.toml` (usually `~/.config/SteamVrMcp/config.toml`) overrides the detection. Unknown keys are rejected.
+Paths are detected, so most machines need no config. An optional `$XDG_CONFIG_HOME/SteamVR-MCP/config.toml` (usually `~/.config/SteamVR-MCP/config.toml`) overrides the detection. Unknown keys are rejected.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -262,7 +262,7 @@ These come from testing, and no test checks them. They may differ by game, GPU o
 
 ## What it changes on your system
 
-The first `vr_start` saves a snapshot to `$XDG_STATE_HOME/SteamVrMcp/restore.json` (usually `~/.local/state/SteamVrMcp/`). The snapshot holds:
+The first `vr_start` saves a snapshot to `$XDG_STATE_HOME/SteamVR-MCP/restore.json` (usually `~/.local/state/SteamVR-MCP/`). The snapshot holds:
 
 - the absolute paths of `steamvr.vrsettings`, the ALVR session file, `vrcompositor` and the ALVR driver, as found at that start;
 - the `external_drivers` list from `openvrpaths.vrpath`;
@@ -293,8 +293,8 @@ The MCP writes `restore.json`, `steamvr.vrsettings`, `openvrpaths.vrpath` and th
 
 It also keeps its own files:
 
-- `$XDG_STATE_HOME/SteamVrMcp/`: `restore.json`, the OpenVR action manifest (`openvr/`), compositor screenshots (`screenshots/`) and Proton launch logs (`runs/`).
-- `$XDG_RUNTIME_DIR/SteamVrMcp/`: the lease, the `alvr_dashboard` link and audio recordings (`audio/`). This is a tmpfs that goes away at logout.
+- `$XDG_STATE_HOME/SteamVR-MCP/`: `restore.json`, the OpenVR action manifest (`openvr/`), compositor screenshots (`screenshots/`) and Proton launch logs (`runs/`).
+- `$XDG_RUNTIME_DIR/SteamVR-MCP/`: the lease, the `alvr_dashboard` link and audio recordings (`audio/`). This is a tmpfs that goes away at logout.
 
 ### vr_stop
 
@@ -319,7 +319,7 @@ It reports `restored: false` and keeps both `restore.json` and the lease when:
 - `openvrpaths.vrpath` cannot be read or written. The other steps still run, and a note says what failed. Fix the file and run `vr_restore` again.
 - A recorded file's directory is gone, for example a SteamVR library or the streamer on a drive that is not mounted. It puts back the rest, notes `left <file> unrestored: its directory is gone`, and rewrites `restore.json` as partial, holding only the skipped entries. `vr_start` refuses while it exists. Mount the drive and run `vr_restore` again, which retries only those entries. If you removed the install on purpose, run `vr_restore {forget_missing: true}` instead: it restores what it can, drops each entry whose directory is gone with a note, deletes `restore.json` and reports `restored: true`.
 - A recorded file's directory cannot be checked, for example after a permission error or on a dead network mount. The entry is kept, `forget_missing` never drops it, and the note names the directory. Restore access to it and run `vr_restore` again.
-- `restore.json` comes from an older SteamVrMcp that recorded no paths. `vr_restore` detects the paths, stores them in `restore.json` and names them in the note. `forget_missing` stays off for that file: if the paths are right, mount or reinstall what is gone and run `vr_restore` again; if they are wrong, correct them in `restore.json` by hand.
+- `restore.json` comes from an older SteamVR-MCP that recorded no paths. `vr_restore` detects the paths, stores them in `restore.json` and names them in the note. `forget_missing` stays off for that file: if the paths are right, mount or reinstall what is gone and run `vr_restore` again; if they are wrong, correct them in `restore.json` by hand.
 
 It refuses while any SteamVR process runs (`vrserver`, `vrcompositor`, `vrmonitor`, `vrdashboard`, `vrwebhelper`, `vrstartup`, `steamtours`), because they can still rewrite `steamvr.vrsettings`; the message names them. It also refuses while a `vr_start`, `vr_stop` or SteamVR restart runs, or while this MCP runs a session. Run `vr_stop` first.
 
@@ -327,7 +327,7 @@ It refuses while any SteamVR process runs (`vrserver`, `vrcompositor`, `vrmonito
 
 ## Sharing SteamVR between agents
 
-Several MCP processes (several agent sessions) on one machine share one SteamVR through a lease in `$XDG_RUNTIME_DIR/SteamVrMcp/`.
+Several MCP processes (several agent sessions) on one machine share one SteamVR through a lease in `$XDG_RUNTIME_DIR/SteamVR-MCP/`.
 
 - Any tool that changes something takes the lease by itself, for 30 minutes unless `vr_acquire` sets `ttl_s` (600 to 14400 s), and renews it once half is left. `vr_acquire` is only needed to choose the name or the ttl. The MCP forgets that name and ttl when the lease is released, so the next lease is under its own name again.
 - While another live MCP holds the lease, the mutating tools disappear from the list and answer `not ready: SteamVR is leased to ...`.
@@ -341,7 +341,7 @@ Several MCP processes (several agent sessions) on one machine share one SteamVR 
 The server logs through `env_logger` to stderr, and by default only errors are shown. Set `RUST_LOG` in the server's environment for more:
 
 ```sh
-claude mcp add --scope user -e RUST_LOG=info SteamVrMcp -- /path/to/target/release/SteamVrMcp
+claude mcp add --scope user -e RUST_LOG=info SteamVR-MCP -- /path/to/target/release/SteamVR-MCP
 ```
 
 `warn` adds recoverable problems (skipped events, a reader left running), `info` adds ALVR's client messages, and `debug` is verbose. A one-line note per MCP client connection is always printed.
@@ -358,7 +358,7 @@ Start with `vr_status`: each failed check names its reason and the fix.
 | `steam_native` | No Steam, or Flatpak Steam | Install native Steam or set `steam_dir`. |
 | `steamvr_installed` | No `bin/linux64/vrserver` | Install SteamVR (app 250820) and run it once, or set `steamvr_dir`. |
 | `alvr_streamer` | No ALVR driver, or another ALVR version | Install the 21.0.0-dev14 streamer and set `streamer_dir`. |
-| `alvr_dashboard_absent` | ALVR's dashboard or another SteamVrMcp runs | Close it. |
+| `alvr_dashboard_absent` | ALVR's dashboard or another SteamVR-MCP runs | Close it. |
 | `audio_input` | No default audio input | Enable one. |
 | `gpu_direct_mode` | Only NVIDIA, or no AMD or Intel GPU | Run SteamVR on AMD or Intel; on hybrids set `steam.env`. |
 | `h264_encoder` | No VA-API H.264 encoder on that GPU | Install VA-API drivers with H.264 encoding. |

@@ -135,7 +135,7 @@ pub fn config_check(loaded: &alvr_common::anyhow::Result<Config>) -> Check {
         Ok(_) => Ok("config.toml parses, or is absent".to_owned()),
         Err(e) => Err(format!("{e:#}")),
     };
-    check("config", result, "fix $XDG_CONFIG_HOME/SteamVrMcp/config.toml; vr_start reads it again while nothing runs (vr_stop first)")
+    check("config", result, "fix $XDG_CONFIG_HOME/SteamVR-MCP/config.toml; vr_start reads it again while nothing runs (vr_stop first)")
 }
 
 /// Quick prerequisite checks without side effects.
@@ -228,10 +228,10 @@ fn driver_versions(bytes: &[u8]) -> Vec<String> {
 
 /// The one static check cheap enough for every vr_status.
 pub fn dashboard_check() -> Check {
-    check("alvr_dashboard_absent", dashboard_absent(), "close the ALVR dashboard (or the other SteamVrMcp)")
+    check("alvr_dashboard_absent", dashboard_absent(), "close the ALVR dashboard (or the other SteamVR-MCP)")
 }
 
-/// Our own `alvr_dashboard` child is fine; any other one (the real dashboard, another SteamVrMcp) is not.
+/// Our own `alvr_dashboard` child is fine; any other one (the real dashboard, another SteamVR-MCP) is not.
 fn dashboard_absent() -> Result<String, String> {
     let others: Vec<String> = steamvr::pids_named("alvr_dashboard")
         .into_iter()

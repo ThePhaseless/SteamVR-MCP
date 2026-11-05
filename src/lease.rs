@@ -121,7 +121,7 @@ mod tests {
     };
 
     fn dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("SteamVrMcp-lease-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("SteamVR-MCP-lease-{name}-{}", std::process::id()));
         fs::remove_dir_all(&dir).ok();
         dir
     }

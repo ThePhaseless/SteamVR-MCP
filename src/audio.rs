@@ -77,7 +77,7 @@ pub fn capture(seconds: f64) -> Result<Vec<i16>> {
     timer.update_timer(Some(deadline), None).into_result()?;
     let stream = StreamRc::new(
         core.clone(),
-        "SteamVrMcp-capture",
+        "SteamVR-MCP-capture",
         properties::properties! {
             *keys::MEDIA_TYPE => "Audio",
             *keys::MEDIA_CATEGORY => "Capture",

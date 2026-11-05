@@ -27,7 +27,7 @@ use sys::*;
 
 /// Written to `state_dir/openvr/` and loaded with SetActionManifestPath.
 /// Not runtime_dir: vrserver runs in the Steam Linux Runtime container, which shares the home
-/// directory but not /run/user/<uid>/SteamVrMcp (probe: ActionManifestError_FileNotFound).
+/// directory but not /run/user/<uid>/SteamVR-MCP (probe: ActionManifestError_FileNotFound).
 const ASSETS: [(&str, &str); 3] = [
     ("actions.json", include_str!("../assets/openvr/actions.json")),
     ("bindings_knuckles.json", include_str!("../assets/openvr/bindings_knuckles.json")),
@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn assets_are_replaced_whole_and_left_alone_when_unchanged() {
         use std::os::unix::fs::MetadataExt;
-        let dir = std::env::temp_dir().join(format!("SteamVrMcp-openvr-assets-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("SteamVR-MCP-openvr-assets-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("actions.json");
         write_asset(&path, "old").unwrap();

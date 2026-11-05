@@ -1,7 +1,7 @@
 {
   "controller_type": "knuckles",
-  "name": "SteamVrMcp skeletons",
-  "description": "Hand skeletons for the SteamVrMcp tracked-state reader",
+  "name": "SteamVR-MCP skeletons",
+  "description": "Hand skeletons for the SteamVR-MCP tracked-state reader",
   "bindings": {
     "/actions/main": {
       "skeleton": [

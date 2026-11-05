@@ -82,9 +82,9 @@ pub fn main() {
     let xr_instance = entry
         .create_instance(
             &xr::ApplicationInfo {
-                application_name: "SteamVrMcp xr_probe",
+                application_name: "SteamVR-MCP xr_probe",
                 application_version: 0,
-                engine_name: "SteamVrMcp xr_probe",
+                engine_name: "SteamVR-MCP xr_probe",
                 engine_version: 0,
                 api_version: xr::Version::new(1, 0, 0),
             },

@@ -19,9 +19,9 @@ fn vr_status_applies_a_fixed_config() {
         eprintln!("skipped: SteamVR runs, and the config is applied only while nothing runs");
         return;
     }
-    let root = std::env::temp_dir().join(format!("SteamVrMcp-config-reload-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("SteamVR-MCP-config-reload-{}", std::process::id()));
     fs::remove_dir_all(&root).ok();
-    let file = root.join("xdg/SteamVrMcp/config.toml");
+    let file = root.join("xdg/SteamVR-MCP/config.toml");
     fs::create_dir_all(file.parent().unwrap()).unwrap();
     unsafe { std::env::set_var("XDG_CONFIG_HOME", root.join("xdg")) };
     let streamer = |name: &str| format!("streamer_dir = {:?}\n", root.join(name).display().to_string());

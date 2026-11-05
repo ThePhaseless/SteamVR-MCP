@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "SteamVrMcp"
+name = "SteamVR-MCP"
 version = "0.1.0"
 dependencies = [
  "alvr_audio",

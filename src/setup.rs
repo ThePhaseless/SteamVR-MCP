@@ -742,7 +742,7 @@ mod tests {
 
     #[test]
     fn blocked_drivers_lists_true_blocks() {
-        let dir = std::env::temp_dir().join(format!("SteamVrMcp-blocked-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("SteamVR-MCP-blocked-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let file = dir.join("steamvr.vrsettings");
         fs::write(&file, r#"{"driver_a":{"blocked_by_safe_mode":true},"driver_b":{"blocked_by_safe_mode":false},"steamvr":{"blocked_by_safe_mode":true}}"#).unwrap();
@@ -824,7 +824,7 @@ mod tests {
 
     #[test]
     fn unblock_safe_mode_sets_false_and_reports() {
-        let path = std::env::temp_dir().join(format!("SteamVrMcp-vrsettings-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("SteamVR-MCP-vrsettings-{}", std::process::id()));
         fs::write(&path, r#"{"driver_alvr_server":{"blocked_by_safe_mode":true}}"#).unwrap();
         assert!(unblock_safe_mode(&path).unwrap());
         let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -836,7 +836,7 @@ mod tests {
     #[test]
     fn write_atomic_refuses_a_read_only_target_and_keeps_the_mode() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("SteamVrMcp-atomic-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("SteamVR-MCP-atomic-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         // chmod 444 keeps SteamVR from resetting `runtime` in openvrpaths.vrpath

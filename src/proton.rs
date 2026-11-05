@@ -311,7 +311,7 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
 
     fn root(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("SteamVrMcp-proton-{name}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("SteamVR-MCP-proton-{name}-{}", std::process::id()));
         fs::remove_dir_all(&root).ok();
         fs::create_dir_all(&root).unwrap();
         root

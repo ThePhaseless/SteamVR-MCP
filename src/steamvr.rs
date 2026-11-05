@@ -991,7 +991,7 @@ mod tests {
     }
 
     fn fake_steam(name: &str) -> PathBuf {
-        let steam = std::env::temp_dir().join(format!("SteamVrMcp-{name}-{}", std::process::id()));
+        let steam = std::env::temp_dir().join(format!("SteamVR-MCP-{name}-{}", std::process::id()));
         fs::remove_dir_all(&steam).ok();
         fs::create_dir_all(steam.join("steamapps")).unwrap();
         steam
@@ -1134,7 +1134,7 @@ mod tests {
 
     #[test]
     fn log_tail_keeps_the_last_lines() {
-        let steam = std::env::temp_dir().join(format!("SteamVrMcp-log-tail-{}", std::process::id()));
+        let steam = std::env::temp_dir().join(format!("SteamVR-MCP-log-tail-{}", std::process::id()));
         fs::create_dir_all(steam.join("logs")).unwrap();
         fs::write(steam.join("logs/vrserver.txt"), "a\nb\nc\n").unwrap();
         assert_eq!(log_tail(&steam, "vrserver", 2), ["b", "c"]);
@@ -1177,8 +1177,8 @@ mod tests {
     #[test]
     fn runtime_dir_must_be_private() {
         use std::os::unix::fs::{PermissionsExt, symlink};
-        let root = std::env::temp_dir().join(format!("SteamVrMcp-runtime-{}", std::process::id()));
-        let dir = root.join("SteamVrMcp");
+        let root = std::env::temp_dir().join(format!("SteamVR-MCP-runtime-{}", std::process::id()));
+        let dir = root.join("SteamVR-MCP");
         private_dir(&dir).unwrap();
         assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
         private_dir(&dir).unwrap();
@@ -1240,7 +1240,7 @@ mod tests {
 
     /// A temp steamvr.vrsettings holding `json`.
     fn vrsettings(name: &str, json: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("SteamVrMcp-steamvr-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("SteamVR-MCP-steamvr-{name}-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("steamvr.vrsettings"), json).unwrap();
         dir.join("steamvr.vrsettings")
@@ -1280,7 +1280,7 @@ mod tests {
 
     #[test]
     fn a_restart_that_vr_stop_ended_never_relaunches() {
-        let root = std::env::temp_dir().join(format!("SteamVrMcp-steamvr-restart-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("SteamVR-MCP-steamvr-restart-{}", std::process::id()));
         fs::remove_dir_all(&root).ok();
         fs::create_dir_all(root.join("steam/config")).unwrap();
         fs::write(root.join("steam/config/steamvr.vrsettings"), "{}").unwrap();

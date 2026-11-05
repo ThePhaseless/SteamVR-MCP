@@ -2485,7 +2485,7 @@ mod tests {
 
     /// A temp Steam tree with a blocked driver and, when `restore`, a restore.json that unblocks it.
     fn blocked_stack(name: &str, restore: bool) -> (Arc<Stack>, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!("SteamVrMcp-stack-{name}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("SteamVR-MCP-stack-{name}-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
         let (steam_dir, state_dir) = (root.join("steam"), root.join("state"));
         std::fs::create_dir_all(steam_dir.join("config")).unwrap();
@@ -2534,7 +2534,7 @@ mod tests {
 
     /// A stack whose stop() ends only processes named `name`, holding its lease in a temp dir.
     fn fake_vr_stack(name: &'static str, grace_ms: u64) -> (Arc<Stack>, PathBuf) {
-        let root = std::env::temp_dir().join(format!("SteamVrMcp-stack-{name}"));
+        let root = std::env::temp_dir().join(format!("SteamVR-MCP-stack-{name}"));
         std::fs::remove_dir_all(&root).ok();
         let paths = Paths { steam_dir: None, flatpak_steam: false, steamvr_dir: None, streamer_dir: None, state_dir: root.join("state"), runtime_dir: root.join("run") };
         let names = Box::leak(Box::new([name]));
@@ -2601,7 +2601,7 @@ mod tests {
 
     /// A stack whose stop() ends no VR process and waits 300 ms on the fake Steam `names`, with its lease in a temp dir.
     fn fake_steam_stack(tag: &str, names: &[&'static str]) -> (Arc<Stack>, PathBuf) {
-        let root = std::env::temp_dir().join(format!("SteamVrMcp-stack-steam-{tag}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("SteamVR-MCP-stack-steam-{tag}-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
         let paths = Paths { steam_dir: None, flatpak_steam: false, steamvr_dir: None, streamer_dir: None, state_dir: root.join("state"), runtime_dir: root.join("run") };
         let steam: &'static [&'static str] = Box::leak(names.to_vec().into_boxed_slice());
@@ -2749,7 +2749,7 @@ mod tests {
     #[test]
     fn kill_waits_for_the_earlier_names_before_the_last() {
         let (a, b) = (fake_name("ka"), fake_name("kb"));
-        let marker = std::env::temp_dir().join(format!("SteamVrMcp-stack-kill-marker-{}", std::process::id()));
+        let marker = std::env::temp_dir().join(format!("SteamVR-MCP-stack-kill-marker-{}", std::process::id()));
         std::fs::remove_file(&marker).ok();
         let first = fake_vr(a, &format!("trap '' TERM; touch {}; while :; do sleep 0.1; done", marker.display()));
         assert!(steamvr::wait_for(Duration::from_secs(5), || marker.exists()), "TERM is ignored before kill() runs");
@@ -2843,7 +2843,7 @@ mod tests {
 
     #[test]
     fn claim_takes_the_lease_and_status_shows_it() {
-        let dir = std::env::temp_dir().join(format!("SteamVrMcp-stack-lease-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("SteamVR-MCP-stack-lease-{}", std::process::id()));
         let stack = test_stack();
         stack.paths.lock().runtime_dir = dir.clone();
         assert!(stack.status().owner.is_none());
@@ -2861,7 +2861,7 @@ mod tests {
 
     #[test]
     fn a_release_forgets_the_holder_name_and_ttl() {
-        let dir = std::env::temp_dir().join(format!("SteamVrMcp-stack-lease-forget-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("SteamVR-MCP-stack-lease-forget-{}", std::process::id()));
         let stack = test_stack();
         stack.paths.lock().runtime_dir = dir.clone();
         stack.acquire_lease("driver".into(), Some(7200)).unwrap();
@@ -2875,7 +2875,7 @@ mod tests {
 
     #[test]
     fn vr_release_refuses_while_this_mcp_runs_a_session() {
-        let dir = std::env::temp_dir().join(format!("SteamVrMcp-stack-vr-release-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("SteamVR-MCP-stack-vr-release-{}", std::process::id()));
         let stack = test_stack();
         stack.paths.lock().runtime_dir = dir.clone();
         stack.claim().unwrap();
@@ -3015,7 +3015,7 @@ mod tests {
         assert_eq!(stack.start().unwrap_err().to_string(), "ALVR streamer not found; set streamer_dir in config.toml");
         assert_eq!(head_y(&stack), 2.1, "a refused start keeps the rig");
         let stack = test_stack();
-        stack.paths.lock().streamer_dir = Some(std::env::temp_dir().join(format!("SteamVrMcp-stack-rig-reset-{}", std::process::id())));
+        stack.paths.lock().streamer_dir = Some(std::env::temp_dir().join(format!("SteamVR-MCP-stack-rig-reset-{}", std::process::id())));
         raise(&stack);
         assert_eq!(stack.start().unwrap_err().to_string(), "unit tests never start a headset");
         assert_eq!(head_y(&stack), 1.6, "a start that begins a session starts from the defaults");
@@ -3110,7 +3110,7 @@ mod tests {
         assert!(!stop_is_ours(false, false, true, || false), "a dashboard alone: SteamVR may be the user's");
         assert!(stop_is_ours(false, false, true, || true), "its dashboard and ALVR's block: our failed start");
         assert!(stop_is_ours(true, false, false, || false) && stop_is_ours(false, true, false, || false));
-        let file = std::env::temp_dir().join(format!("SteamVrMcp-stack-ours-{}.vrsettings", std::process::id()));
+        let file = std::env::temp_dir().join(format!("SteamVR-MCP-stack-ours-{}.vrsettings", std::process::id()));
         std::fs::write(&file, r#"{"driver_alvr_server":{"blocked_by_safe_mode":true}}"#).unwrap();
         assert!(stop_is_ours(false, false, true, || setup::alvr_blocked(&file)));
         std::fs::write(&file, r#"{"driver_lighthouse":{"blocked_by_safe_mode":true}}"#).unwrap();
@@ -3160,7 +3160,7 @@ mod tests {
 
     #[test]
     fn adoption_reads_a_stuck_entry_from_the_session_file() {
-        let dir = std::env::temp_dir().join(format!("SteamVrMcp-stack-session-file-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("SteamVR-MCP-stack-session-file-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("session.json");
         // as ALVR saves it, cut to the part read here
@@ -3305,7 +3305,7 @@ mod tests {
 
     #[test]
     fn read_when_stable_waits_for_the_writer() {
-        let dir = std::env::temp_dir().join(format!("SteamVrMcp-stack-stable-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("SteamVR-MCP-stack-stable-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("shot.png");
         // `exited` runs at the start of each poll, so the writer acts at known polls whatever the load
@@ -3344,7 +3344,7 @@ mod tests {
     }
 
     /// vrcompositor.txt after a TakeStereoScreenshot (stem vr-1-2) with an OpenXR scene app under Proton.
-    const COMPOSITOR_REQUESTED: &str = "Tue Oct 27 2026 21:14:02.100 [Info] - Screenshot: Take stereo screenshot request dest filename=\"/h/.local/state/SteamVrMcp/screenshots/vr-1-2-preview\"\n\
+    const COMPOSITOR_REQUESTED: &str = "Tue Oct 27 2026 21:14:02.100 [Info] - Screenshot: Take stereo screenshot request dest filename=\"/h/.local/state/SteamVR-MCP/screenshots/vr-1-2-preview\"\n\
         Tue Oct 27 2026 21:14:02.104 [Info] - Screenshot: Marked submission of screenshot textures for screenshot type 2, flags 3\n\
         Tue Oct 27 2026 21:14:02.110 [Info] - Screenshot: Capturing Stereo2D texture\n";
     const COMPOSITOR_FAILED: &str = "Tue Oct 27 2026 21:14:02.116 [Info] - Screenshot: Failed to get the correct textures.\n";
@@ -3818,7 +3818,7 @@ mod tests {
 
     #[test]
     fn wait_for_log_sees_lines_logged_before_the_call() {
-        let root = std::env::temp_dir().join(format!("SteamVrMcp-stack-wait-log-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("SteamVR-MCP-stack-wait-log-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
         let steam = root.join("steam");
         std::fs::create_dir_all(steam.join("steamapps")).unwrap();
