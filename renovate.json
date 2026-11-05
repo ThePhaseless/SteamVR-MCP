@@ -1,4 +1,12 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["local>ThePhaseless/renovate-config"]
+  "extends": ["local>ThePhaseless/renovate-config"],
+  "packageRules": [
+    {
+      "description": "pipewire must share libspa-sys with alvr_audio, which is still on 0.9; both link libspa-0.2",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["pipewire"],
+      "allowedVersions": "<0.10"
+    }
+  ]
 }
