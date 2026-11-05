@@ -2000,7 +2000,7 @@ impl Stack {
                     logs.flush_partial(id);
                 }
                 // scanned every round: the ring evicts past LINES_KEPT before a long drain ends
-                let hit = loop {
+                loop {
                     let page = logs.page(id, cursor, None, applog::PAGE).map_err(|e| anyhow!(e))?;
                     cursor = page.next_seq;
                     if let Some((result, line)) = applog::find_match(&page.lines, &pattern, fail.as_ref()) {
@@ -2009,8 +2009,7 @@ impl Stack {
                     if page.lines.len() < applog::PAGE {
                         break None;
                     }
-                };
-                hit
+                }
             };
             if let Some((result, line)) = hit {
                 return Ok(serde_json::json!({ "result": result, "line": line, "next_seq": line.seq + 1 }));
