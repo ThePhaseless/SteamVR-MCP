@@ -12,7 +12,7 @@ env:
 jobs:
   ci:
     # a versioned label, so Renovate offers the next Ubuntu as a PR that CI tests first; ubuntu-latest moves without one
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7.0.1
       # alsa-sys and pipewire-sys link through pkg-config, bindgen needs libclang, openh264-sys2 assembles with nasm
